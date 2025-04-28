@@ -119,14 +119,14 @@ def analyze_directory(directory, output_base, base_directory, min_size_gb=2, use
     large_subdirs = []
     
     for line in du_output.strip().split('\n'):
-        parts = line.split('\t')
+        parts = line.strip().split('\t')
         if len(parts) != 2:
             continue
             
         size_str, path = parts
         
-        # Skip the directory itself
-        if path == directory:
+        # Skip the directory itself (precise path comparison)
+        if os.path.normpath(path) == os.path.normpath(directory):
             continue
             
         # Convert size to bytes (handle units like K, M, G, T)
@@ -141,8 +141,10 @@ def analyze_directory(directory, output_base, base_directory, min_size_gb=2, use
                 # If directory exceeds threshold and is actually a directory, process it
                 if size_bytes >= min_size_bytes and os.path.isdir(path):
                     large_subdirs.append(path)
+                    print(f"Found large subdirectory: {path} ({size_str})")
         except (ValueError, TypeError) as e:
-            print(f"Error parsing size for {path}: {e}")
+            if not quiet:
+                print(f"Error parsing size for {path}: {e}")
     
     # Process large subdirectories recursively
     for subdir in large_subdirs:
@@ -160,6 +162,8 @@ def main():
                         help='Use sudo for du commands (access more directories)')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Suppress error messages from du command')
+    parser.add_argument('--debug', '-d', action='store_true',
+                        help='Enable debug output')
     
     args = parser.parse_args()
     
