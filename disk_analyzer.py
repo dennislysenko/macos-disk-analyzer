@@ -5,6 +5,7 @@ import subprocess
 import argparse
 from pathlib import Path
 import re
+import datetime
 
 def parse_size(size_str):
     """Convert size string with units to bytes."""
@@ -100,15 +101,18 @@ def analyze_directory(directory, output_base, base_directory, min_size_gb=2, use
     path_component = format_path_for_output(base_directory, directory)
     
     # Create proper output directory path
-    if path_component == os.path.basename(base_directory):
-        # For the base directory, just use the output base
+    if os.path.normpath(directory) == os.path.normpath(base_directory):
+        # For the base directory itself, use the output base directly
         output_dir = output_base
+        output_filename = "disk_usage.txt"
     else:
         # For subdirectories, maintain the directory structure
-        output_dir = create_output_dir(output_base, os.path.dirname(path_component))
+        output_dir = os.path.join(output_base, path_component)
+        # Create the directory
+        os.makedirs(output_dir, exist_ok=True)
+        output_filename = "disk_usage.txt"
     
     # Save results
-    output_filename = os.path.basename(path_component) + "_disk_usage.txt"
     output_path = os.path.join(output_dir, output_filename)
     save_results(output_path, du_output)
     
@@ -155,7 +159,7 @@ def main():
     parser.add_argument('directory', nargs='?', default=os.path.expanduser('~'),
                         help='Base directory to analyze (default: user home)')
     parser.add_argument('--output', '-o', default='./output',
-                        help='Output directory (default: ./output)')
+                        help='Base output directory (default: ./output)')
     parser.add_argument('--min-size', '-m', type=float, default=2.0,
                         help='Minimum size in GB to process subdirectories (default: 2.0)')
     parser.add_argument('--sudo', '-s', action='store_true',
@@ -167,9 +171,14 @@ def main():
     
     args = parser.parse_args()
     
+    # Generate timestamp for this run
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
     # Convert to absolute paths
     directory = os.path.abspath(args.directory)
-    output_base = os.path.abspath(args.output)
+    # Create a timestamped output directory
+    base_output = os.path.abspath(args.output)
+    output_base = os.path.join(base_output, timestamp)
     
     # Create output directory
     os.makedirs(output_base, exist_ok=True)
