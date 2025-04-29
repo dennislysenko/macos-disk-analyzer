@@ -1,6 +1,12 @@
 # Disk Analyzer
 
 A Python script that analyzes disk usage recursively on directories exceeding a specified size threshold.
+Created because OmniDiskSweeper was killing me with freezes and pauses.
+
+## Demo (Browser Feature)
+
+![Browser Demo](browser.gif)
+
 
 ## Features
 
@@ -74,3 +80,39 @@ The script creates text files in the output directory, maintaining the relative 
 By default, the script will display error messages from the `du` command. These errors typically occur when the tool can't access certain directories due to permission restrictions.
 
 If you prefer to hide these error messages (similar to using `2>/dev/null` in the original command), use the `--quiet` option. 
+
+## Disk Usage Browser
+
+The disk analyzer includes an interactive terminal-based browser to navigate and visualize the analysis results:
+
+```bash
+# Run the browser to view previous analysis results
+python3 browser.py
+
+# Specify a custom output directory
+python3 browser.py --output /path/to/output
+```
+
+### Browser Features
+
+- **Timestamp Selection**: Choose from previous analysis runs sorted by date/time
+- **Directory Navigation**: Explore directories and subdirectories analyzed during each run
+- **Size Information**: View size of each directory and its subdirectories
+- **Sorted Display**: Directories are sorted by size (largest first) for easy identification of space usage
+- **Parent Directory Navigation**: Navigate back to parent directories using the ".." option
+
+### Browser Controls
+
+- **↑/↓**: Move selection up/down
+- **Enter**: Select a directory to navigate into it
+- **r**: Return to run selection to view a different analysis timestamp
+- **q**: Quit the browser
+
+### How the Browser Works
+
+1. The browser first shows a list of available analysis runs by timestamp
+2. After selecting a run, it displays the root directory with its subdirectories sorted by size
+3. When navigating into subdirectories, it automatically loads the appropriate analysis data
+4. Each directory displays its total size and the sizes of all immediate subdirectories
+
+The browser makes it easy to identify which directories are consuming the most disk space on your system. 
