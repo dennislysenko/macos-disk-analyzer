@@ -4,6 +4,7 @@ import os
 import datetime
 import curses
 import argparse
+import subprocess
 
 class OutputBrowser:
     def __init__(self, output_dir="./output"):
@@ -233,6 +234,16 @@ class OutputBrowser:
         
         stdscr.refresh()
     
+    def open_in_finder(self, path):
+        """Open the specified path in Finder"""
+        try:
+            # Use subprocess to run the 'open' command which opens Finder on macOS
+            subprocess.run(['open', path])
+            return True
+        except Exception as e:
+            self.log(f"Error opening Finder: {str(e)}")
+            return False
+    
     def browser(self, stdscr):
         """Main curses-based browser"""
         # Setup curses
@@ -351,7 +362,7 @@ class OutputBrowser:
                 
                 # Display footer
                 footer_pos = height - 2
-                footer = "↑/↓: Move selection, Enter: Select, r: Select run, q: Quit"
+                footer = "↑/↓: Move selection, Enter: Select, o: Open in Finder, r: Select run, q: Quit"
                 stdscr.addstr(footer_pos, 0, footer[:width-1], curses.A_BOLD)
             except curses.error:
                 # Catch curses errors (may happen during resizing)
@@ -371,6 +382,17 @@ class OutputBrowser:
                     self.scroll_offset = 0
                 else:
                     break
+            elif key == ord('o'):
+                # Open current directory in Finder
+                if os.path.exists(self.current_path):
+                    # Temporarily suspend curses
+                    curses.endwin()
+                    success = self.open_in_finder(self.current_path)
+                    # Resume curses
+                    stdscr.refresh()
+                    if not success:
+                        self.show_message(stdscr, "Failed to open directory in Finder.\nPress any key to continue.")
+                        stdscr.getch()
             elif key == curses.KEY_UP:
                 if self.selected_idx > 0:
                     self.selected_idx -= 1

@@ -105,6 +105,7 @@ python3 browser.py --output /path/to/output
 
 - **↑/↓**: Move selection up/down
 - **Enter**: Select a directory to navigate into it
+- **o**: Open the current directory in Finder
 - **r**: Return to run selection to view a different analysis timestamp
 - **q**: Quit the browser
 
