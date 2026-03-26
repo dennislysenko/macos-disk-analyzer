@@ -1,3 +1,4 @@
 output
 .DS_Store
 browser_debug.log
+__pycache__/

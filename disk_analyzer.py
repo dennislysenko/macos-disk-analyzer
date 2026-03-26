@@ -7,6 +7,30 @@ from pathlib import Path
 import re
 import datetime
 
+def _normalize_path(path_str):
+    """Resolve a path without failing if it doesn't exist."""
+    try:
+        return Path(path_str).resolve(strict=False)
+    except Exception:
+        return Path(path_str)
+
+EXCLUDED_PATHS = [_normalize_path("/System/Volumes")]
+
+def is_excluded_path(path_str):
+    """Return True if the given path is in, or under, an excluded path."""
+    normalized = _normalize_path(path_str)
+    return any(normalized == excluded or excluded in normalized.parents for excluded in EXCLUDED_PATHS)
+
+def filter_excluded_entries(du_output):
+    """Remove du output lines that point to excluded paths."""
+    filtered_lines = []
+    for line in du_output.splitlines():
+        parts = line.split('\t', 1)
+        if len(parts) == 2 and is_excluded_path(parts[1].strip()):
+            continue
+        filtered_lines.append(line)
+    return '\n'.join(filtered_lines)
+
 def parse_size(size_str):
     """Convert size string with units to bytes."""
     units = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
@@ -90,11 +114,20 @@ def analyze_directory(directory, output_base, base_directory, min_size_gb=2, use
         use_sudo: Whether to use sudo for du commands
         quiet: Whether to suppress error messages
     """
+    if is_excluded_path(directory):
+        if not quiet:
+            print(f"Skipping excluded directory: {directory}")
+        return
+    
     print(f"Analyzing: {directory}")
     
     # Run du command on current directory
     du_output = run_du_command(directory, use_sudo, quiet)
     if not du_output:
+        return
+    
+    du_output = filter_excluded_entries(du_output)
+    if not du_output.strip():
         return
     
     # Create output structure
@@ -128,6 +161,9 @@ def analyze_directory(directory, output_base, base_directory, min_size_gb=2, use
             continue
             
         size_str, path = parts
+        
+        if is_excluded_path(path):
+            continue
         
         # Skip the directory itself (precise path comparison)
         if os.path.normpath(path) == os.path.normpath(directory):
