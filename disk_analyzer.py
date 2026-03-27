@@ -20,7 +20,7 @@ def _normalize_path(path_str):
 
 EXCLUDED_PATHS = [
     _normalize_path("/System/Volumes"),
-    _normalize_path("/System/Library"),
+    _normalize_path("/System"),  # read-only sealed volume; firmlinks cause double-counting with Data volume
     _normalize_path("/dev"),
     _normalize_path("/proc"),
     _normalize_path("/sys"),

@@ -5,6 +5,10 @@ import datetime
 import curses
 import argparse
 import subprocess
+import threading
+import time
+
+from disk_analyzer import run_du_command, filter_excluded_entries
 
 # Color pair IDs for percentage thresholds
 COLOR_PCT_1 = 1   # 2.5-5%
@@ -15,6 +19,7 @@ COLOR_PCT_5 = 5   # 20-30%
 COLOR_PCT_6 = 6   # 30-40%
 COLOR_PCT_7 = 7   # 40-50%
 COLOR_PCT_8 = 8   # 50%+
+COLOR_SCAN = 9    # rescan progress
 
 class OutputBrowser:
     def __init__(self, output_dir="./output"):
@@ -30,6 +35,14 @@ class OutputBrowser:
         self.root_size_bytes = 0
         # Set up log file path in the output directory
         self.log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_debug.log")
+        # Rescan state
+        self._scan_thread = None
+        self._scan_result = None  # will hold (du_output, target_path) when done
+        self._scan_start = None
+        self._scan_cancel = threading.Event()
+        self._scan_durations = {}  # path -> last scan duration in seconds
+        self._scan_target_path = None  # the path being rescanned
+        self._scan_target_idx = None  # index in options list being rescanned
         
     def log(self, message):
         """Write a debug message to the log file with timestamp"""
@@ -262,12 +275,183 @@ class OutputBrowser:
     def open_in_finder(self, path):
         """Open the specified path in Finder"""
         try:
-            # Use subprocess to run the 'open' command which opens Finder on macOS
             subprocess.run(['open', path])
             return True
         except Exception as e:
             self.log(f"Error opening Finder: {str(e)}")
             return False
+
+    def _rescan_worker(self, target_path):
+        """Background worker: run du on target_path and store the result."""
+        self.log(f"Rescan started for: {target_path}")
+        du_output = run_du_command(target_path, quiet=True)
+        if self._scan_cancel.is_set():
+            self.log("Rescan was cancelled")
+            return
+        if du_output:
+            du_output = filter_excluded_entries(du_output)
+        self._scan_result = (du_output, target_path)
+        self.log(f"Rescan finished for: {target_path}")
+
+    def start_rescan(self, target_path, target_idx=None):
+        """Kick off a background rescan of a specific path."""
+        if self._scan_thread and self._scan_thread.is_alive():
+            return  # already scanning
+        self._scan_result = None
+        self._scan_cancel.clear()
+        self._scan_start = time.monotonic()
+        self._scan_target_path = target_path
+        self._scan_target_idx = target_idx
+        self._scan_thread = threading.Thread(
+            target=self._rescan_worker,
+            args=(target_path,),
+            daemon=True,
+        )
+        self._scan_thread.start()
+
+    def is_scanning(self):
+        return self._scan_thread is not None and self._scan_thread.is_alive()
+
+    def scan_elapsed(self):
+        if self._scan_start is None:
+            return 0.0
+        return time.monotonic() - self._scan_start
+
+    def _format_bytes_human(self, size_bytes):
+        """Convert bytes to human-readable string matching du output format."""
+        if size_bytes == 0:
+            return "0B"
+        units = [(1024**4, 'T'), (1024**3, 'G'), (1024**2, 'M'), (1024, 'K')]
+        for threshold, unit in units:
+            if size_bytes >= threshold:
+                val = size_bytes / threshold
+                if val >= 10:
+                    return f"{val:.0f}{unit}"
+                else:
+                    return f"{val:.1f}{unit}"
+        return f"{size_bytes:.0f}B"
+
+    def _update_parent_disk_usage(self, target_path, new_total_size_str):
+        """Update the parent directory's disk_usage.txt to reflect the new size of target_path.
+        Then propagate upward recursively until we reach root_path."""
+        parent_path = os.path.dirname(target_path)
+
+        # Find the parent's disk_usage.txt
+        parent_rel = os.path.relpath(parent_path, self.root_path)
+        if parent_rel == ".":
+            parent_file = os.path.join(self.output_dir, self.timestamp_dir, "disk_usage.txt")
+        else:
+            parent_file = os.path.join(self.output_dir, self.timestamp_dir, parent_rel, "disk_usage.txt")
+
+        if not os.path.exists(parent_file):
+            self.log(f"Parent disk_usage.txt not found: {parent_file}")
+            return
+
+        # Read parent file and update the line for target_path
+        lines = []
+        updated = False
+        with open(parent_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) == 2 and os.path.normpath(parts[1]) == os.path.normpath(target_path):
+                    lines.append(f"{new_total_size_str}\t{parts[1]}\n")
+                    updated = True
+                else:
+                    lines.append(line)
+
+        if not updated:
+            self.log(f"Target path {target_path} not found in parent file {parent_file}")
+            return
+
+        # Re-sum the parent total: add up all children
+        parent_total = 0
+        for line in lines:
+            parts = line.strip().split('\t')
+            if len(parts) == 2:
+                p = os.path.normpath(parts[1])
+                if p != os.path.normpath(parent_path):
+                    parent_total += self.parse_size_to_bytes(parts[0])
+
+        # Update the parent's own total line
+        new_parent_size_str = self._format_bytes_human(parent_total)
+        final_lines = []
+        for line in lines:
+            parts = line.strip().split('\t')
+            if len(parts) == 2 and os.path.normpath(parts[1]) == os.path.normpath(parent_path):
+                final_lines.append(f"{new_parent_size_str}\t{parts[1]}\n")
+            else:
+                final_lines.append(line)
+
+        with open(parent_file, 'w') as f:
+            f.writelines(final_lines)
+        self.log(f"Updated parent {parent_file}: {target_path} -> {new_total_size_str}, parent total -> {new_parent_size_str}")
+
+        # If the current view is showing this parent's data, reload it
+        if os.path.normpath(self.current_path) == os.path.normpath(parent_path):
+            new_data = []
+            for line in final_lines:
+                parts = line.strip().split('\t')
+                if len(parts) == 2:
+                    new_data.append((parts[0], parts[1]))
+            if new_data:
+                self.disk_usage_data = new_data
+
+        # Propagate upward
+        if os.path.normpath(parent_path) != os.path.normpath(self.root_path):
+            self._update_parent_disk_usage(parent_path, new_parent_size_str)
+        else:
+            # We've reached root — update root_size_bytes
+            self.root_size_bytes = parent_total
+
+    def apply_scan_result(self):
+        """Apply completed rescan result: save to disk, update parents, reload browser."""
+        if self._scan_result is None:
+            return False
+        du_output, target_path = self._scan_result
+        self._scan_result = None
+        self._scan_thread = None
+        self._scan_target_idx = None
+
+        if not du_output or not du_output.strip():
+            self.log("Rescan produced no output")
+            return False
+
+        # Compute output path and save
+        rel_path = os.path.relpath(target_path, self.root_path)
+        if rel_path == ".":
+            output_file = os.path.join(self.output_dir, self.timestamp_dir, "disk_usage.txt")
+        else:
+            output_dir = os.path.join(self.output_dir, self.timestamp_dir, rel_path)
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, "disk_usage.txt")
+
+        with open(output_file, "w") as f:
+            f.write(du_output)
+        self.log(f"Rescan saved to: {output_file}")
+
+        # Parse the new data to find the total size of the rescanned dir
+        new_data = []
+        new_total_size_str = None
+        for line in du_output.strip().splitlines():
+            parts = line.strip().split('\t')
+            if len(parts) == 2:
+                new_data.append((parts[0], parts[1]))
+                if os.path.normpath(parts[1]) == os.path.normpath(target_path):
+                    new_total_size_str = parts[0]
+
+        # Update parent disk_usage.txt files up the chain
+        if new_total_size_str and os.path.normpath(target_path) != os.path.normpath(self.root_path):
+            self._update_parent_disk_usage(target_path, new_total_size_str)
+
+        # If we rescanned the directory we're currently viewing, reload its data
+        if os.path.normpath(target_path) == os.path.normpath(self.current_path):
+            if new_data:
+                self.disk_usage_data = new_data
+                if target_path == self.root_path:
+                    self.root_size_bytes = self.parse_size_to_bytes(new_data[0][0])
+                self.log(f"Rescan loaded {len(new_data)} entries for current view")
+
+        return True
     
     def _detect_dark_theme(self):
         """Detect if terminal has a dark background via COLORFGBG env var."""
@@ -300,6 +484,12 @@ class OutputBrowser:
             ]
         for i, c in enumerate(colors):
             curses.init_pair(i + 1, c, bg)
+
+        # Scan progress color: cyan on 256-color, cyan on 8-color
+        if curses.COLORS >= 256:
+            curses.init_pair(COLOR_SCAN, 45, bg)  # bright cyan
+        else:
+            curses.init_pair(COLOR_SCAN, curses.COLOR_CYAN, bg)
 
     def _pct_color(self, pct):
         """Return the curses color pair attribute for a percentage value."""
@@ -422,6 +612,20 @@ class OutputBrowser:
 
                         name, path, size, numeric = options[i]
 
+                        # Show "Rescanning..." overlay for the item being scanned
+                        if self.is_scanning() and i == self._scan_target_idx:
+                            elapsed = self.scan_elapsed()
+                            spinner = "|/-\\"[int(elapsed * 4) % 4]
+                            prev = self._scan_durations.get(self._scan_target_path)
+                            if prev is not None:
+                                remaining = max(0, prev - elapsed)
+                                rescan_text = f"{spinner} Rescanning {name}... {elapsed:.0f}s / ~{prev:.0f}s (ETA ~{remaining:.0f}s)"
+                            else:
+                                rescan_text = f"{spinner} Rescanning {name}... {elapsed:.0f}s"
+                            attr = curses.A_BOLD | curses.color_pair(COLOR_SCAN)
+                            stdscr.addstr(y_pos, 0, rescan_text[:width-1], attr)
+                            continue
+
                         # Format and draw with per-column coloring
                         if size:
                             pct_folder = (numeric / current_size_bytes * 100) if current_size_bytes > 0 else 0
@@ -461,19 +665,72 @@ class OutputBrowser:
                 
                 # Display footer
                 footer_pos = height - 2
-                footer = "↑/↓: Move selection, Enter: Select, o: Open in Finder, r: Select run, q: Quit"
-                stdscr.addstr(footer_pos, 0, footer[:width-1], curses.A_BOLD)
+                if self.is_scanning():
+                    elapsed = self.scan_elapsed()
+                    spinner = "|/-\\"[int(elapsed * 4) % 4]
+                    target_name = os.path.basename(self._scan_target_path) if self._scan_target_path else "..."
+                    prev = self._scan_durations.get(self._scan_target_path)
+                    if prev is not None:
+                        remaining = max(0, prev - elapsed)
+                        scan_footer = f" {spinner} Rescanning {target_name}... {elapsed:.0f}s / ~{prev:.0f}s (ETA ~{remaining:.0f}s) (c: cancel)"
+                    else:
+                        scan_footer = f" {spinner} Rescanning {target_name}... {elapsed:.0f}s elapsed (c: cancel)"
+                    stdscr.addstr(footer_pos, 0, scan_footer[:width-1], curses.A_BOLD | curses.color_pair(COLOR_SCAN))
+                else:
+                    footer = "↑/↓: Navigate, Enter: Select, s: Rescan, o: Finder, r: Select run, q: Quit"
+                    stdscr.addstr(footer_pos, 0, footer[:width-1], curses.A_BOLD)
             except curses.error:
-                # Catch curses errors (may happen during resizing)
                 pass
-            
+
             stdscr.refresh()
-            
-            # Handle key input
-            key = stdscr.getch()
-            
+
+            # Check if a background scan has completed
+            if self._scan_result is not None:
+                elapsed = self.scan_elapsed()
+                self._scan_durations[self._scan_target_path] = elapsed
+                if self.apply_scan_result():
+                    self.selected_idx = 0
+                    self.scroll_offset = 0
+                    # Flash a brief confirmation
+                    try:
+                        footer_pos = height - 2
+                        msg = f" Rescan complete ({elapsed:.1f}s)"
+                        stdscr.addstr(footer_pos, 0, msg[:width-1], curses.A_BOLD)
+                        stdscr.refresh()
+                        curses.napms(800)
+                    except curses.error:
+                        pass
+                continue
+
+            # Use non-blocking input during scans so the UI stays responsive
+            if self.is_scanning():
+                stdscr.nodelay(True)
+                key = stdscr.getch()
+                if key == -1:
+                    curses.napms(100)  # brief sleep to avoid busy loop
+                    continue
+            else:
+                stdscr.nodelay(False)
+                key = stdscr.getch()
+
             if key == ord('q'):
+                if self.is_scanning():
+                    self._scan_cancel.set()
                 break
+            elif key == ord('c') and self.is_scanning():
+                self._scan_cancel.set()
+                self._scan_thread = None
+                self._scan_result = None
+                self._scan_start = None
+                self._scan_target_path = None
+                self._scan_target_idx = None
+                continue
+            elif key == ord('s') and not self.is_scanning():
+                if options and 0 <= self.selected_idx < len(options):
+                    _, sel_path, _, _ = options[self.selected_idx]
+                    if sel_path and os.path.isdir(sel_path):
+                        self.start_rescan(sel_path, self.selected_idx)
+                continue
             elif key == ord('r'):
                 if self.display_timestamp_selector(stdscr):
                     # Reset everything when selecting a new timestamp
