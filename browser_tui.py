@@ -6,6 +6,16 @@ import curses
 import argparse
 import subprocess
 
+# Color pair IDs for percentage thresholds
+COLOR_PCT_1 = 1   # 2.5-5%
+COLOR_PCT_2 = 2   # 5-10%
+COLOR_PCT_3 = 3   # 10-15%
+COLOR_PCT_4 = 4   # 15-20%
+COLOR_PCT_5 = 5   # 20-30%
+COLOR_PCT_6 = 6   # 30-40%
+COLOR_PCT_7 = 7   # 40-50%
+COLOR_PCT_8 = 8   # 50%+
+
 class OutputBrowser:
     def __init__(self, output_dir="./output"):
         self.output_dir = os.path.abspath(output_dir)
@@ -17,6 +27,7 @@ class OutputBrowser:
         self.selected_idx = 0
         self.scroll_offset = 0
         self.max_display_items = 0
+        self.root_size_bytes = 0
         # Set up log file path in the output directory
         self.log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_debug.log")
         
@@ -26,6 +37,20 @@ class OutputBrowser:
         with open(self.log_file, "a") as f:
             f.write(f"[{timestamp}] {message}\n")
         
+    def parse_size_to_bytes(self, size_str):
+        """Convert size string with units (like '2.5G') to bytes"""
+        if not size_str or size_str == "?":
+            return 0
+        size_str = size_str.strip()
+        multiplier = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4, 'B': 1}
+        try:
+            if size_str[-1].upper() in multiplier:
+                return float(size_str[:-1]) * multiplier[size_str[-1].upper()]
+            else:
+                return float(size_str)
+        except (ValueError, IndexError):
+            return 0
+
     def load_timestamps(self):
         """Load all timestamp directories from the output folder"""
         timestamps = []
@@ -121,8 +146,7 @@ class OutputBrowser:
         # Sort by numeric size (largest first), then by name for equal sizes
         entries.sort(key=lambda x: (-x[3], x[0].lower()))
         
-        # Remove the numeric size from the final entries
-        return size, [(name, path, size) for name, path, size, _ in entries]
+        return size, [(name, path, size, numeric) for name, path, size, numeric in entries]
             
     def display_timestamp_selector(self, stdscr):
         """Display a fullscreen menu to select a timestamp"""
@@ -209,6 +233,7 @@ class OutputBrowser:
                     # Find the first directory (typically the base directory)
                     if self.disk_usage_data:
                         self.current_path = self.disk_usage_data[0][1]  # Path of the first entry
+                        self.root_size_bytes = self.parse_size_to_bytes(self.disk_usage_data[0][0])
                         return True
         
         return False
@@ -244,13 +269,67 @@ class OutputBrowser:
             self.log(f"Error opening Finder: {str(e)}")
             return False
     
+    def _detect_dark_theme(self):
+        """Detect if terminal has a dark background via COLORFGBG env var."""
+        colorfgbg = os.environ.get('COLORFGBG', '')
+        if ';' in colorfgbg:
+            try:
+                bg = int(colorfgbg.rsplit(';', 1)[1])
+                # bg 0-6 = dark colors, 7+ = light colors
+                return bg < 7
+            except ValueError:
+                pass
+        # Default to dark theme (most common for terminal users)
+        return True
+
+    def _init_colors(self):
+        """Initialize color pairs adapted to terminal theme."""
+        curses.start_color()
+        curses.use_default_colors()
+        bg = -1  # transparent background, inherits terminal default
+
+        if curses.COLORS >= 256:
+            # 8-step palette: yellow -> yellow-orange -> orange -> red
+            colors = [226, 220, 214, 208, 202, 196, 160, 124]
+        else:
+            colors = [
+                curses.COLOR_YELLOW, curses.COLOR_YELLOW,
+                curses.COLOR_YELLOW, curses.COLOR_RED,
+                curses.COLOR_RED, curses.COLOR_RED,
+                curses.COLOR_RED, curses.COLOR_RED,
+            ]
+        for i, c in enumerate(colors):
+            curses.init_pair(i + 1, c, bg)
+
+    def _pct_color(self, pct):
+        """Return the curses color pair attribute for a percentage value."""
+        if pct >= 50:
+            return curses.color_pair(COLOR_PCT_8) | curses.A_BOLD
+        elif pct >= 40:
+            return curses.color_pair(COLOR_PCT_7)
+        elif pct >= 30:
+            return curses.color_pair(COLOR_PCT_6)
+        elif pct >= 20:
+            return curses.color_pair(COLOR_PCT_5)
+        elif pct >= 15:
+            return curses.color_pair(COLOR_PCT_4)
+        elif pct >= 10:
+            return curses.color_pair(COLOR_PCT_3)
+        elif pct >= 5:
+            return curses.color_pair(COLOR_PCT_2)
+        elif pct >= 2.5:
+            return curses.color_pair(COLOR_PCT_1)
+        else:
+            return curses.A_NORMAL
+
     def browser(self, stdscr):
         """Main curses-based browser"""
         # Setup curses
         curses.curs_set(0)  # Hide cursor
+        self._init_colors()
         stdscr.clear()
         stdscr.refresh()
-        
+
         # Enable keypad (for arrow keys)
         stdscr.keypad(True)
         
@@ -266,7 +345,7 @@ class OutputBrowser:
             height, width = stdscr.getmaxyx()
             
             # Adjust max display items based on screen height
-            self.max_display_items = height - 8
+            self.max_display_items = height - 9
             
             # Get current directory information
             current_size, current_entries = self.get_current_directory_info()
@@ -280,12 +359,15 @@ class OutputBrowser:
                 self.root_path = self.disk_usage_data[0][1]
                 self.log(f"Setting root path to: {self.root_path}")
             
+            # Compute current folder size in bytes for percentage calc
+            current_size_bytes = self.parse_size_to_bytes(current_size)
+
             # Add parent directory entry if not at the root level
             if self.current_path != getattr(self, 'root_path', None):
                 parent_dir = os.path.dirname(self.current_path)
-                options.append((".. (Parent Directory)", parent_dir, ""))
+                options.append((".. (Parent Directory)", parent_dir, "", 0))
                 self.log(f"Added parent directory: {parent_dir}")
-            
+
             # Add current entries
             options.extend(current_entries)
             
@@ -317,35 +399,52 @@ class OutputBrowser:
                 
                 # Divider
                 stdscr.addstr(4, 0, "-" * (width - 1))
-                
+
+                # Column layout: fixed-width name, then Size, %Dir, %Tot
+                col_size = 6
+                col_pct = 6  # "XX.X%"
+                name_width = 40
+
+                # Column header
+                col_header = f"{'Name':<{name_width}}  {'Size':>{col_size}} {'%Dir':>{col_pct}} {'%Tot':>{col_pct}}"
+                stdscr.addstr(5, 0, col_header[:width-1], curses.A_DIM)
+
                 # Display directories
                 if not options:
-                    stdscr.addstr(6, 0, "No subdirectories found")
+                    stdscr.addstr(7, 0, "No subdirectories found")
                 else:
                     # Calculate display range
                     display_end = min(self.scroll_offset + self.max_display_items, len(options))
-                    
+
                     for i in range(self.scroll_offset, display_end):
                         # Calculate screen position
-                        y_pos = 5 + (i - self.scroll_offset)
-                        
-                        name, path, size = options[i]
-                        
-                        # Format display string
+                        y_pos = 6 + (i - self.scroll_offset)
+
+                        name, path, size, numeric = options[i]
+
+                        # Format and draw with per-column coloring
                         if size:
-                            display_text = f"{name} - {size}"
+                            pct_folder = (numeric / current_size_bytes * 100) if current_size_bytes > 0 else 0
+                            pct_total = (numeric / self.root_size_bytes * 100) if self.root_size_bytes > 0 else 0
+                            truncated_name = (name[:name_width-3] + '...') if len(name) > name_width else name
+                            name_size_part = f"{truncated_name:<{name_width}}  {size:>{col_size}}"
+                            pct_dir_str = f" {pct_folder:>{col_pct - 1}.1f}%"
+                            pct_tot_str = f" {pct_total:>{col_pct - 1}.1f}%"
+
+                            selected = i == self.selected_idx
+                            base_attr = curses.A_REVERSE if selected else curses.A_NORMAL
+                            stdscr.addstr(y_pos, 0, name_size_part[:width-1], base_attr)
+                            col_pos = len(name_size_part)
+                            if col_pos + len(pct_dir_str) < width - 1:
+                                pct_attr = base_attr if selected else (base_attr | self._pct_color(pct_folder))
+                                stdscr.addstr(y_pos, col_pos, pct_dir_str, pct_attr)
+                                col_pos += len(pct_dir_str)
+                            if col_pos + len(pct_tot_str) < width - 1:
+                                pct_attr = base_attr if selected else (base_attr | self._pct_color(pct_total))
+                                stdscr.addstr(y_pos, col_pos, pct_tot_str, pct_attr)
                         else:
-                            display_text = name
-                            
-                        # Truncate if too long
-                        if len(display_text) > width - 2:
-                            display_text = display_text[:width-5] + "..."
-                        
-                        # Highlight selected item
-                        if i == self.selected_idx:
-                            stdscr.addstr(y_pos, 0, display_text, curses.A_REVERSE)
-                        else:
-                            stdscr.addstr(y_pos, 0, display_text)
+                            base_attr = curses.A_REVERSE if i == self.selected_idx else curses.A_NORMAL
+                            stdscr.addstr(y_pos, 0, name[:width-1], base_attr)
                 
                 # Show scrollbar if needed
                 if len(options) > self.max_display_items:
@@ -354,7 +453,7 @@ class OutputBrowser:
                     scrollbar_start = int((self.scroll_offset / len(options)) * self.max_display_items)
                     
                     for i in range(self.max_display_items):
-                        y_pos = 5 + i
+                        y_pos = 6 + i
                         if scrollbar_start <= i < scrollbar_start + scrollbar_height:
                             stdscr.addstr(y_pos, width - 2, "█")
                         else:
@@ -380,6 +479,8 @@ class OutputBrowser:
                     # Reset everything when selecting a new timestamp
                     self.selected_idx = 0
                     self.scroll_offset = 0
+                    self.root_path = self.current_path
+                    self.root_size_bytes = self.parse_size_to_bytes(self.disk_usage_data[0][0]) if self.disk_usage_data else 0
                 else:
                     break
             elif key == ord('o'):
@@ -402,7 +503,7 @@ class OutputBrowser:
             elif key == curses.KEY_ENTER or key == 10 or key == 13:  # Enter key
                 if options and 0 <= self.selected_idx < len(options):
                     # Get the selected option
-                    name, path, _ = options[self.selected_idx]
+                    name, path, _, _ = options[self.selected_idx]
                     
                     # Check if it's the parent directory option
                     if name == ".. (Parent Directory)":

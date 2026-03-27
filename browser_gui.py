@@ -17,6 +17,7 @@ class DiskAnalyzerGUI:
         self.timestamp_dir = None
         self.disk_usage_data = []
         self.root_path = None
+        self.root_size_bytes = 0
 
         # Create main window
         self.root = tk.Tk()
@@ -306,6 +307,7 @@ class DiskAnalyzerGUI:
         # Set the current path to the first directory (typically the base directory)
         self.current_path = self.disk_usage_data[0][1]
         self.root_path = self.current_path
+        self.root_size_bytes = self.parse_size_to_bytes(self.disk_usage_data[0][0])
 
         # Update the display
         self.update_display()
@@ -400,9 +402,14 @@ class DiskAnalyzerGUI:
             self.directory_listbox.insert(tk.END, ".. (Parent Directory)")
             self.current_entries.append((".. (Parent Directory)", parent_dir, "", 0))
 
-        # Add entries
+        # Compute current folder size for percentage
+        current_size_bytes = self.parse_size_to_bytes(current_size)
+
+        # Add entries with percentage columns
         for name, path, size, numeric in entries:
-            display_text = f"{name} - {size}"
+            pct_folder = (numeric / current_size_bytes * 100) if current_size_bytes > 0 else 0
+            pct_total = (numeric / self.root_size_bytes * 100) if self.root_size_bytes > 0 else 0
+            display_text = f"{name}  {size:>6}  {pct_folder:5.1f}% dir  {pct_total:5.1f}% tot"
             self.directory_listbox.insert(tk.END, display_text)
             self.current_entries.append((name, path, size, numeric))
 
