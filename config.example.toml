@@ -1,0 +1,21 @@
+# Disk Analyzer Configuration
+# Copy this file to ~/.config/disk-analyzer/config.toml
+
+# Default directory to analyze (default: your home directory)
+# default_directory = "~"
+
+# Minimum size in GB to recurse into subdirectories (default: 2.0)
+# min_size_gb = 2.0
+
+# Output directory for analysis results (default: ./output)
+# output_dir = "./output"
+
+# Number of parallel workers (default: 4)
+# workers = 4
+
+# Timeout in seconds per du command (default: 300)
+# timeout = 300
+
+# API key for AI-powered explanations (beta)
+# Supports Claude or OpenAI keys. Can also be set via DISK_ANALYZER_API_KEY env var.
+# api_key = ""
