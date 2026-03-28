@@ -20,7 +20,7 @@ def _normalize_path(path_str):
 
 EXCLUDED_PATHS = [
     _normalize_path("/System/Volumes"),
-    _normalize_path("/System"),  # read-only sealed volume; firmlinks cause double-counting with Data volume
+    _normalize_path("/System/Library"),
     _normalize_path("/dev"),
     _normalize_path("/proc"),
     _normalize_path("/sys"),
@@ -40,21 +40,95 @@ def is_excluded_path(path_str):
     normalized = _normalize_path(path_str)
     return any(normalized == excluded or excluded in normalized.parents for excluded in EXCLUDED_PATHS)
 
+def _format_bytes(size_bytes):
+    """Convert bytes to human-readable string matching du output format."""
+    if size_bytes == 0:
+        return "0B"
+    units = [(1024**4, 'T'), (1024**3, 'G'), (1024**2, 'M'), (1024, 'K')]
+    for threshold, unit in units:
+        if size_bytes >= threshold:
+            val = size_bytes / threshold
+            if val >= 100:
+                return f"{val:.0f}{unit}"
+            elif val >= 10:
+                return f"{val:.0f}{unit}"
+            else:
+                return f"{val:.1f}{unit}"
+    return f"{size_bytes:.0f}B"
+
+
 def filter_excluded_entries(du_output):
-    """Remove du output lines that point to excluded paths."""
+    """Remove du output lines that point to excluded paths,
+    then recompute the directory total as the sum of remaining children.
+    This corrects inflated totals caused by APFS firmlinks."""
+    if not du_output:
+        return du_output
+
     filtered_lines = []
+    removed_any = False
     for line in du_output.splitlines():
         parts = line.split('\t', 1)
         if len(parts) == 2 and is_excluded_path(parts[1].strip()):
+            removed_any = True
             continue
         filtered_lines.append(line)
-    return '\n'.join(filtered_lines)
+
+    if not removed_any or not filtered_lines:
+        return '\n'.join(filtered_lines)
+
+    # Recompute the directory total (first line after sort -hr is the largest,
+    # which is typically the directory itself). Find the directory total line
+    # and replace its size with the sum of its children.
+    # The directory's own line is the one whose path is the parent of all others.
+    all_paths = []
+    for line in filtered_lines:
+        parts = line.split('\t', 1)
+        if len(parts) == 2:
+            all_paths.append((parts[0].strip(), parts[1].strip()))
+
+    if len(all_paths) < 2:
+        return '\n'.join(filtered_lines)
+
+    # Find the "parent" entry — the path that is a parent of all other paths
+    parent_path = None
+    parent_line_idx = None
+    for i, (size_str, path) in enumerate(all_paths):
+        is_parent = all(
+            os.path.normpath(path) == os.path.normpath(other_path) or
+            os.path.normpath(path) in [str(p) for p in Path(other_path).parents]
+            for _, other_path in all_paths
+        )
+        if is_parent:
+            parent_path = path
+            parent_line_idx = i
+            break
+
+    if parent_path is None:
+        return '\n'.join(filtered_lines)
+
+    # Sum children (everything except the parent line)
+    children_total = 0
+    for size_str, path in all_paths:
+        if os.path.normpath(path) != os.path.normpath(parent_path):
+            children_total += parse_size(size_str)
+
+    # Replace the parent's size in the output
+    new_size = _format_bytes(children_total)
+    result_lines = []
+    for line in filtered_lines:
+        parts = line.split('\t', 1)
+        if len(parts) == 2 and os.path.normpath(parts[1].strip()) == os.path.normpath(parent_path):
+            result_lines.append(f"{new_size}\t{parts[1]}")
+        else:
+            result_lines.append(line)
+
+    return '\n'.join(result_lines)
 
 def parse_size(size_str):
     """Convert size string with units to bytes."""
-    units = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
+    units = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4, 'B': 1}
     size_str = size_str.upper()
-    
+
     if size_str[-1] in units:
         return float(size_str[:-1]) * units[size_str[-1]]
     return float(size_str)
@@ -67,9 +141,23 @@ def format_path_for_output(base_path, target_path):
 def run_du_command(directory, use_sudo=False, quiet=False, timeout_seconds=300):
     """Run the du command on the specified directory and sort results.
 
-    timeout_seconds is a soft timeout: logs a warning but does NOT kill the process.
+    timeout_seconds is a slow-scan threshold: logs a warning but does NOT kill the process.
     """
-    du_cmd = ["sudo", "du", "-h", "-d", "1", directory] if use_sudo else ["du", "-h", "-d", "1", directory]
+    # Use -I to tell macOS du to skip directories by basename.
+    # Only include names that are unique enough to not cause false positives.
+    du_ignore_names = [
+        "Volumes",         # external drives, Time Machine
+        ".Spotlight-V100",
+        ".fseventsd",
+    ]
+    ignore_flags = []
+    for name in du_ignore_names:
+        ignore_flags.extend(["-I", name])
+
+    if use_sudo:
+        du_cmd = ["sudo", "du", "-h", "-d", "1"] + ignore_flags + [directory]
+    else:
+        du_cmd = ["du", "-h", "-d", "1"] + ignore_flags + [directory]
 
     try:
         t0 = time.monotonic()
@@ -95,9 +183,9 @@ def run_du_command(directory, use_sudo=False, quiet=False, timeout_seconds=300):
         log.info(f"du finished in {elapsed:.1f}s for {directory} ({len(du_result.stdout.splitlines())} lines)")
 
         if elapsed > timeout_seconds:
-            log.warning(f"SOFT TIMEOUT: {directory} took {elapsed:.1f}s (threshold {timeout_seconds}s)")
+            log.warning(f"SLOW: {directory} took {elapsed:.1f}s (threshold {timeout_seconds}s)")
             with _print_lock:
-                print(f"  SLOW: {directory} took {elapsed:.1f}s (soft timeout was {timeout_seconds}s)")
+                print(f"  SLOW: {directory} took {elapsed:.1f}s (warn threshold {timeout_seconds}s)")
         elif elapsed > 10:
             log.warning(f"SLOW: {directory} took {elapsed:.1f}s")
 
@@ -314,18 +402,24 @@ def main():
                         help='Minimum size in GB to process subdirectories (default: 2.0)')
     parser.add_argument('--sudo', '-s', action='store_true',
                         help='Use sudo for du commands (access more directories)')
-    parser.add_argument('--quiet', '-q', action='store_true',
-                        help='Suppress error messages from du command')
+    parser.add_argument('--quiet', '-q', action='store_true', default=True,
+                        help='Suppress error messages from du command (default: on)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Show du error messages (disables quiet mode)')
     parser.add_argument('--debug', '-d', action='store_true',
                         help='Enable debug output')
-    parser.add_argument('--workers', '-w', type=int, default=4,
-                        help='Number of parallel workers (default: 4)')
-    parser.add_argument('--timeout', '-t', type=int, default=300,
-                        help='Timeout in seconds per du command (default: 300)')
+    parser.add_argument('--workers', '-w', type=int, default=8,
+                        help='Number of parallel workers (default: 8)')
+    parser.add_argument('--timeout', '-t', type=int, default=120,
+                        help='Warn when a directory scan exceeds this many seconds (default: 120)')
     parser.add_argument('--log-file', default=None,
                         help='Log file path (default: disk_analyzer.log in output dir)')
 
     args = parser.parse_args()
+
+    # --verbose overrides --quiet
+    if args.verbose:
+        args.quiet = False
 
     # Generate timestamp for this run
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -359,7 +453,7 @@ def main():
     print(f"Target:     {directory}")
     print(f"Output:     {output_base}")
     print(f"Workers:    {args.workers}")
-    print(f"Timeout:    {args.timeout}s per directory")
+    print(f"Slow warn:  {args.timeout}s per directory")
     print(f"Min size:   {args.min_size}GB")
     print(f"Log file:   {log_file}")
     if args.sudo:
