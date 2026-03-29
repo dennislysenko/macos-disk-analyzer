@@ -1,9 +1,9 @@
 #!/bin/bash
-# Run the GUI browser with the virtual environment
 
-# Get the directory where this script is located
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+# Legacy wrapper — prefer using `disk-analyzer` or `python3 disk_analyzer_cli.py browse --gui` instead.
+# This script launches the GUI browser (requires matplotlib).
 
-# Activate virtual environment and run the GUI
-source "$SCRIPT_DIR/venv/bin/activate"
-python "$SCRIPT_DIR/browser.py" --gui "$@"
+echo "Note: consider using 'python3 disk_analyzer_cli.py browse --gui' instead."
+echo ""
+
+python3 "$(dirname "$0")/disk_analyzer_cli.py" browse --gui "$@"
