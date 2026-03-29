@@ -56,7 +56,7 @@ disk-analyzer browse --output /path/to/output
 | `--min-size`, `-m` | Min size in GB to recurse | `2.0` |
 | `--sudo`, `-s` | Use sudo for `du` commands | off |
 | `--quiet`, `-q` | Suppress `du` error messages | off |
-| `--workers`, `-w` | Parallel workers | `4` |
+| `--workers`, `-w` | Parallel workers | `8` |
 | `--timeout`, `-t` | Timeout per directory (seconds) | `300` |
 
 ### Browser Controls

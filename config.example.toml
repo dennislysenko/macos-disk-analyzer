@@ -10,8 +10,8 @@
 # Output directory for analysis results (default: ./output)
 # output_dir = "./output"
 
-# Number of parallel workers (default: 4)
-# workers = 4
+# Number of parallel workers (default: 8)
+# workers = 8
 
 # Timeout in seconds per du command (default: 300)
 # timeout = 300

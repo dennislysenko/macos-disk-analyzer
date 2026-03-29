@@ -5,8 +5,11 @@ import sys
 import argparse
 import curses
 
+import json
+
 CONFIG_DIR = os.path.expanduser("~/.config/disk-analyzer")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
+SCAN_HISTORY_FILE = ".scan_history.json"
 
 
 def load_config():
@@ -43,6 +46,59 @@ def get_api_key(config):
 def get_output_dir(config):
     """Get output directory from config or default."""
     return config.get("output_dir", "./output")
+
+
+def load_scan_history(output_dir):
+    """Load prior scan metadata for ETA heuristics."""
+    path = os.path.join(output_dir, SCAN_HISTORY_FILE)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def save_scan_history(output_dir, directory, total_dirs, total_time):
+    """Append scan metadata for future ETA estimates."""
+    path = os.path.join(output_dir, SCAN_HISTORY_FILE)
+    history = load_scan_history(output_dir)
+    history.append({
+        "directory": directory,
+        "total_dirs": total_dirs,
+        "total_time": round(total_time, 1),
+    })
+    # Keep last 20 entries
+    history = history[-20:]
+    try:
+        with open(path, "w") as f:
+            json.dump(history, f, indent=2)
+    except OSError:
+        pass
+
+
+def estimate_from_history(output_dir, directory):
+    """Return (expected_dirs, has_history) based on prior scans of the same directory."""
+    history = load_scan_history(output_dir)
+    # Find prior scans of the same directory
+    matching = [h for h in history if h.get("directory") == directory]
+    if matching:
+        # Use average of matching scans
+        avg_dirs = sum(h["total_dirs"] for h in matching) / len(matching)
+        return int(avg_dirs), True
+    return None, False
+
+
+def format_eta(seconds):
+    """Format seconds into a human-readable ETA string."""
+    if seconds < 0:
+        return "??:??"
+    m, s = divmod(int(seconds), 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h}h{m:02d}m"
+    return f"{m}m{s:02d}s"
 
 
 def tui_main_menu(stdscr):
@@ -137,36 +193,134 @@ def run_scan_tui(stdscr, config):
     import io
     from disk_analyzer import run_analysis, AnalysisStats
 
-    curses.curs_set(1)
-    stdscr.clear()
-    height, width = stdscr.getmaxyx()
-
-    default_dir = config.get("default_directory", os.path.expanduser("~"))
-    default_min = config.get("min_size_gb", "2.0")
-
-    stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-    stdscr.addstr(1, 2, "New Scan")
-    stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
-    stdscr.addstr(2, 2, "─" * min(40, width - 4))
-
-    # Directory input
-    stdscr.addstr(4, 2, f"Directory [{default_dir}]: ")
-    stdscr.refresh()
-    curses.echo()
-    dir_input = stdscr.getstr(4, 2 + len(f"Directory [{default_dir}]: "), 256).decode().strip()
-    directory = dir_input if dir_input else default_dir
-
-    # Min size input
-    stdscr.addstr(6, 2, f"Min size GB [{default_min}]: ")
-    stdscr.refresh()
-    size_input = stdscr.getstr(6, 2 + len(f"Min size GB [{default_min}]: "), 20).decode().strip()
-    curses.noecho()
     curses.curs_set(0)
 
+    home_dir = os.path.expanduser("~")
+    custom_dir = config.get("default_directory", home_dir)
+
+    # --- Step 1: Directory selection ---
+    dir_options = [
+        ("Home folder", home_dir),
+        ("Entire drive", "/"),
+        ("Custom path", None),
+    ]
+    dir_selected = 0
+
+    MIN_SIZES = [0.5, 1.0, 2.0, 5.0, 10.0]
+    default_min = float(config.get("min_size_gb", "2.0"))
     try:
-        min_size = float(size_input) if size_input else float(default_min)
+        size_selected = MIN_SIZES.index(default_min)
     except ValueError:
-        min_size = float(default_min)
+        size_selected = 2  # default to 2.0
+
+    step = 0  # 0 = directory, 1 = min size, 2 = done
+
+    while step < 2:
+        height, width = stdscr.getmaxyx()
+        stdscr.erase()
+
+        # Title
+        stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        stdscr.addstr(1, 2, "New Scan")
+        stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+        stdscr.addstr(2, 2, "─" * min(40, width - 4))
+
+        if step == 0:
+            # Directory selection
+            stdscr.addstr(4, 2, "What to scan:")
+
+            for i, (label, path) in enumerate(dir_options):
+                y = 6 + i
+                if y >= height - 3:
+                    break
+                display = f"{label}  ({path})" if path else label
+                if i == dir_selected:
+                    stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+                    stdscr.addstr(y, 4, f"▸ {display}"[:width - 6])
+                    stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+                else:
+                    stdscr.addstr(y, 4, f"  {display}"[:width - 6])
+
+            try:
+                stdscr.attron(curses.color_pair(3))
+                stdscr.addstr(height - 2, 2, "↑/↓: Select  Enter: Confirm  q: Cancel")
+                stdscr.attroff(curses.color_pair(3))
+            except curses.error:
+                pass
+
+        elif step == 1:
+            # Min size selection
+            stdscr.addstr(4, 2, "Minimum directory size to recurse into:")
+            stdscr.attron(curses.color_pair(3))
+            stdscr.addstr(5, 2, "Smaller = more detail but slower scan"[:width - 4])
+            stdscr.addstr(6, 2, "Larger  = faster scan, only big folders"[:width - 4])
+            stdscr.attroff(curses.color_pair(3))
+
+            for i, size in enumerate(MIN_SIZES):
+                y = 8 + i
+                if y >= height - 3:
+                    break
+                label = f"{size}GB"
+                if size == 0.5:
+                    hint = "very detailed, slowest"
+                elif size == 1.0:
+                    hint = "detailed"
+                elif size == 2.0:
+                    hint = "balanced (default)"
+                elif size == 5.0:
+                    hint = "fast, big folders only"
+                else:
+                    hint = "fastest, very large only"
+                display = f"{label:<8} {hint}"
+                if i == size_selected:
+                    stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+                    stdscr.addstr(y, 4, f"▸ {display}"[:width - 6])
+                    stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+                else:
+                    stdscr.addstr(y, 4, f"  {display}"[:width - 6])
+
+            try:
+                stdscr.attron(curses.color_pair(3))
+                stdscr.addstr(height - 2, 2, "↑/↓: Select  Enter: Confirm  Backspace: Back  q: Cancel")
+                stdscr.attroff(curses.color_pair(3))
+            except curses.error:
+                pass
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        if key == ord("q"):
+            return
+        elif key in (curses.KEY_BACKSPACE, 127, 8) and step > 0:
+            step -= 1
+        elif key == curses.KEY_UP:
+            if step == 0:
+                dir_selected = (dir_selected - 1) % len(dir_options)
+            else:
+                size_selected = (size_selected - 1) % len(MIN_SIZES)
+        elif key == curses.KEY_DOWN:
+            if step == 0:
+                dir_selected = (dir_selected + 1) % len(dir_options)
+            else:
+                size_selected = (size_selected + 1) % len(MIN_SIZES)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if step == 0 and dir_options[dir_selected][1] is None:
+                # Custom path — need text input
+                stdscr.addstr(10, 4, "Path: ")
+                curses.curs_set(1)
+                curses.echo()
+                path_input = stdscr.getstr(10, 10, 256).decode().strip()
+                curses.noecho()
+                curses.curs_set(0)
+                if path_input:
+                    custom_dir = path_input
+                    dir_options[2] = ("Custom path", custom_dir)
+                step = 1
+            else:
+                step += 1
+
+    directory = dir_options[dir_selected][1]
+    min_size = MIN_SIZES[size_selected]
 
     output_dir = os.path.abspath(get_output_dir(config))
     directory = os.path.abspath(os.path.expanduser(directory))
@@ -186,7 +340,7 @@ def run_scan_tui(stdscr, config):
         force=True,
     )
 
-    workers = int(config.get("workers", 4))
+    workers = int(config.get("workers", 8))
     timeout = int(config.get("timeout", 300))
 
     # Count top-level dirs for progress estimate
@@ -197,8 +351,12 @@ def run_scan_tui(stdscr, config):
     except OSError:
         total_top = 0
 
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    spin_idx = 0
+
     import disk_analyzer
     disk_analyzer._stats = AnalysisStats()
+    disk_analyzer._stats.num_workers = workers
     stats = disk_analyzer._stats
 
     # State shared between scan thread and UI
@@ -207,7 +365,11 @@ def run_scan_tui(stdscr, config):
     scan_done = threading.Event()
     scan_cancelled = threading.Event()
     BAR_WIDTH = max(20, width - 30)
-    expected = max(total_top * 3, 10)
+    hist_expected, has_history = estimate_from_history(output_dir, directory)
+    if hist_expected:
+        expected = hist_expected
+    else:
+        expected = max(total_top * 3, 10)
 
     # Intercept stdout to capture log lines from disk_analyzer
     real_stdout = sys.stdout
@@ -246,6 +408,7 @@ def run_scan_tui(stdscr, config):
     # Fullscreen progress UI
     stdscr.nodelay(True)  # non-blocking getch for cancel detection
     cancelled = False
+    show_workers = True  # True = worker view, False = log view
 
     while not scan_done.is_set():
         height, width = stdscr.getmaxyx()
@@ -260,35 +423,91 @@ def run_scan_tui(stdscr, config):
         info = f"Target: {directory}  |  Min: {min_size}GB  |  Workers: {workers}"
         stdscr.addstr(1, 2, info[:width - 4])
 
-        # Progress bar
+        # Progress bar with ETA
         analyzed = stats.dirs_analyzed
         elapsed = time.monotonic() - stats.start_time
         pct = min(0.95, analyzed / (analyzed + expected))
         filled = int(BAR_WIDTH * pct)
         bar = "█" * filled + "░" * (BAR_WIDTH - filled)
-        bar_line = f"[{bar}] {int(pct*100)}%  {analyzed} dirs | {elapsed:.0f}s"
 
+        # ETA calculation
+        if analyzed > 0:
+            rate = elapsed / analyzed  # seconds per dir
+            remaining_dirs = max(0, expected - analyzed)
+            eta_secs = rate * remaining_dirs
+            eta_str = f"ETA {format_eta(eta_secs)}"
+        else:
+            eta_str = "ETA --:--"
+
+        bar_line = f"[{bar}] {int(pct*100)}%  {analyzed} dirs | {elapsed:.0f}s"
         stdscr.addstr(3, 2, bar_line[:width - 4])
 
-        # Divider
-        stdscr.addstr(4, 2, "─" * min(width - 4, 60))
+        # ETA on its own line
+        eta_note = f"  {eta_str}" + ("  (rough est. — improves after first scan)" if not has_history else "")
+        try:
+            stdscr.attron(curses.color_pair(3))
+            stdscr.addstr(4, 2, eta_note[:width - 4])
+            stdscr.attroff(curses.color_pair(3))
+        except curses.error:
+            pass
 
-        # Scrolling log (fill available space)
-        log_start = 5
-        log_height = height - log_start - 2  # leave room for footer
-        with log_lock:
-            visible = log_lines[-(log_height):] if log_height > 0 else []
-        for i, line in enumerate(visible):
-            y = log_start + i
-            if y >= height - 2:
-                break
-            try:
-                stdscr.addstr(y, 2, line[:width - 4])
-            except curses.error:
-                pass
+        # Divider + view label
+        view_label = " Workers " if show_workers else " Log "
+        divider_width = min(width - 4, 60)
+        divider = "─" * divider_width
+        label_pos = (divider_width - len(view_label)) // 2
+        divider = divider[:label_pos] + view_label + divider[label_pos + len(view_label):]
+        stdscr.addstr(5, 2, divider)
+
+        content_start = 6
+        content_height = height - content_start - 2
+
+        if show_workers:
+            # Per-worker stable numbered view
+            worker_status = stats.get_worker_status()
+            for i, (wnum, wdir, dur) in enumerate(worker_status):
+                y = content_start + i
+                if y >= height - 2:
+                    break
+                try:
+                    label = f"  Worker {wnum:<2}"
+                    stdscr.addstr(y, 2, label)
+                    if wdir:
+                        # Shorten path relative to scan root
+                        display_path = wdir
+                        if wdir.startswith(directory):
+                            rel = wdir[len(directory):]
+                            if directory == "/":
+                                display_path = wdir  # scanning root, show absolute
+                            elif rel:
+                                display_path = rel.lstrip("/")
+                            else:
+                                display_path = os.path.basename(directory)
+                        stdscr.attron(curses.color_pair(2))
+                        stdscr.addstr(y, 14, f"{dur:5.1f}s")
+                        stdscr.attroff(curses.color_pair(2))
+                        stdscr.addstr(y, 21, f" {display_path}"[:width - 22])
+                    else:
+                        stdscr.attron(curses.color_pair(3))
+                        stdscr.addstr(y, 14, f"{SPINNER[spin_idx % len(SPINNER)]} idle")
+                        stdscr.attroff(curses.color_pair(3))
+                except curses.error:
+                    pass
+        else:
+            # Chronological log view
+            with log_lock:
+                visible = log_lines[-(content_height):] if content_height > 0 else []
+            for i, line in enumerate(visible):
+                y = content_start + i
+                if y >= height - 2:
+                    break
+                try:
+                    stdscr.addstr(y, 2, line[:width - 4])
+                except curses.error:
+                    pass
 
         # Footer
-        footer = "c: Cancel scan"
+        footer = "Tab: Toggle view  |  c: Cancel scan"
         try:
             stdscr.attron(curses.color_pair(3))
             stdscr.addstr(height - 1, 2, footer)
@@ -304,7 +523,9 @@ def run_scan_tui(stdscr, config):
         except curses.error:
             key = -1
 
-        if key == ord("c"):
+        if key == ord("\t"):
+            show_workers = not show_workers
+        elif key == ord("c"):
             # Confirm cancel
             stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
             try:
@@ -327,6 +548,7 @@ def run_scan_tui(stdscr, config):
                     disk_analyzer._executor.shutdown(wait=False, cancel_futures=True)
                 break
 
+        spin_idx += 1
         curses.napms(200)  # ~5 fps refresh
 
     stdscr.nodelay(False)
@@ -342,8 +564,10 @@ def run_scan_tui(stdscr, config):
         stdscr.getch()
         return
 
-    # Scan complete — show final state
+    # Scan complete — save history for future ETA estimates
     thread.join()
+    total_time = time.monotonic() - stats.start_time
+    save_scan_history(output_dir, directory, stats.dirs_analyzed, total_time)
     height, width = stdscr.getmaxyx()
     stdscr.erase()
 
@@ -471,7 +695,7 @@ def main():
     scan_parser.add_argument("--debug", "-d", action="store_true",
                              help="Enable debug output")
     scan_parser.add_argument("--workers", "-w", type=int, default=None,
-                             help="Parallel workers (default: 4)")
+                             help="Parallel workers (default: 8)")
     scan_parser.add_argument("--timeout", "-t", type=int, default=None,
                              help="Timeout per directory in seconds (default: 300)")
 
