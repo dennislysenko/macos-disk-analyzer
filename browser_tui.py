@@ -677,7 +677,7 @@ class OutputBrowser:
                         scan_footer = f" {spinner} Rescanning {target_name}... {elapsed:.0f}s elapsed (c: cancel)"
                     stdscr.addstr(footer_pos, 0, scan_footer[:width-1], curses.A_BOLD | curses.color_pair(COLOR_SCAN))
                 else:
-                    footer = "↑/↓: Navigate, Enter: Select, s: Rescan, o: Finder, r: Select run, q: Quit"
+                    footer = "↑/↓: Navigate, Enter: Select, s: Rescan, d: Recommend, o: Finder, r: Select run, q: Quit"
                     stdscr.addstr(footer_pos, 0, footer[:width-1], curses.A_BOLD)
             except curses.error:
                 pass
@@ -740,6 +740,13 @@ class OutputBrowser:
                     self.root_size_bytes = self.parse_size_to_bytes(self.disk_usage_data[0][0]) if self.disk_usage_data else 0
                 else:
                     break
+            elif key == ord('d') and not self.is_scanning():
+                # Show cleanup recommendations for current scan
+                from cleanup_recommendations import generate_recommendations, show_recommendations
+                scan_dir = os.path.join(self.output_dir, self.timestamp_dir)
+                recs = generate_recommendations(scan_dir, self.root_path)
+                show_recommendations(stdscr, recs)
+                continue
             elif key == ord('o'):
                 # Open current directory in Finder
                 if os.path.exists(self.current_path):

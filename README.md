@@ -35,9 +35,10 @@ python3 disk_analyzer_cli.py
 disk-analyzer
 ```
 
-The TUI main menu gives you three options:
+The TUI main menu gives you four options:
 - **Scan** — choose a target (home folder, entire drive, or custom path), pick a min-size threshold, and watch progress in a fullscreen view with per-worker status
 - **Browse** — explore previous scan results sorted by size with color-coded percentages
+- **Recommend** — review cleanup opportunities from prior scans
 - **Quit**
 
 ### Scan UI
@@ -84,9 +85,18 @@ disk-analyzer browse --output /path/to/output
 |-----|--------|
 | ↑/↓ | Navigate |
 | Enter | Select directory |
+| d | Show cleanup recommendations for the current run |
 | o | Open in Finder |
 | r | Return to run selection |
 | q | Quit / back to menu |
+
+## Cleanup Roadmap
+
+The current recommendation view is rule-based and already surfaces obvious reclaimable space like caches, build artifacts, and simulator data.
+
+The next planned step is an "Opportunity Ladder": a deterministic ranking model that shows the safest, largest, most reversible cleanup opportunities first, then progressively climbs toward smaller or riskier items. A Claude-assisted second pass is planned only for ambiguous large folders that need interpretation rather than simple matching.
+
+Design notes: [plans/opportunity_ladder.md](/Users/dennis/dev/disk-analyzer/plans/opportunity_ladder.md)
 
 ## Configuration
 

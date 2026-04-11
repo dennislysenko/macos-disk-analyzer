@@ -8,6 +8,8 @@
 - Delete a folder from the browser
 - Homebrew tap for `brew install disk-analyzer`
 - AI-powered explanations for what's using space (API key plumbing in place)
+- Opportunity Ladder: deterministic cleanup ranking that shows low-hanging fruit first, then progressively higher-risk/smaller items (see plans/opportunity_ladder.md)
+- Claude-assisted review queue for ambiguous large folders after deterministic ranking
 - Use prior scan heuristics to improve ETA accuracy over time
 
 ## Ideas

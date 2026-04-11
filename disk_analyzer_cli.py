@@ -117,6 +117,7 @@ def tui_main_menu(stdscr):
     menu_items = [
         ("Scan", "Run a new disk usage analysis"),
         ("Browse", "Browse previous analysis results"),
+        ("Recommend", "Get cleanup recommendations"),
         ("Quit", "Exit disk-analyzer"),
     ]
 
@@ -176,12 +177,16 @@ def tui_main_menu(stdscr):
                 run_scan_tui(stdscr, config)
             elif choice == "Browse":
                 run_browse_tui(stdscr, config)
+            elif choice == "Recommend":
+                run_recommend_tui(stdscr, config)
         elif key == ord("q"):
             return
         elif key == ord("1"):
             run_scan_tui(stdscr, config)
         elif key == ord("2"):
             run_browse_tui(stdscr, config)
+        elif key == ord("3"):
+            run_recommend_tui(stdscr, config)
 
 
 def run_scan_tui(stdscr, config):
@@ -624,6 +629,20 @@ def run_browse_tui(stdscr, config):
     output_dir = get_output_dir(config)
     browser = OutputBrowser(output_dir)
     browser.browser(stdscr)
+
+
+def run_recommend_tui(stdscr, config):
+    """Show cleanup recommendations for a previous scan."""
+    from browser_tui import OutputBrowser
+    from cleanup_recommendations import generate_recommendations, show_recommendations
+
+    output_dir = get_output_dir(config)
+    browser = OutputBrowser(output_dir)
+    if not browser.display_timestamp_selector(stdscr):
+        return
+    scan_dir = os.path.join(output_dir, browser.timestamp_dir)
+    recommendations = generate_recommendations(scan_dir, browser.current_path)
+    show_recommendations(stdscr, recommendations)
 
 
 def cmd_scan(args):
