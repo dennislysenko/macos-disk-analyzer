@@ -86,6 +86,7 @@ disk-analyzer browse --output /path/to/output
 | ↑/↓ | Navigate |
 | Enter | Select directory |
 | d | Show cleanup recommendations for the current run |
+| x | Move the selected item to Trash |
 | o | Open in Finder |
 | r | Return to run selection |
 | q | Quit / back to menu |

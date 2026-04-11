@@ -11,6 +11,7 @@ import subprocess
 from collections import namedtuple
 
 from disk_analyzer import parse_size, _format_bytes
+from file_actions import move_path_to_trash, remove_path_from_scan
 
 CleanupRule = namedtuple(
     "CleanupRule",
@@ -538,30 +539,38 @@ def _shorten_path(path):
 
 
 def _build_rows(recommendations):
-    """Build a flat render list with tier headers and items."""
-    rows = []
-    current_tier = None
-    for rec in recommendations:
-        if rec.tier != current_tier:
-            current_tier = rec.tier
-            tier_total = sum(
-                item.size_bytes for item in recommendations if item.tier == current_tier
-            )
-            rows.append(
-                {
-                    "kind": "header",
-                    "tier": current_tier,
-                    "label": TIER_LABELS.get(current_tier, current_tier),
-                    "total_human": _format_bytes(tier_total),
-                }
-            )
-        rows.append({"kind": "item", "rec": rec})
-    return rows
+    """Build a flat render list for the current sort order."""
+    return [{"kind": "item", "rec": rec} for rec in recommendations]
 
 
 # ── TUI Display ──────────────────────────────────────────────────────────────
 
-def show_recommendations(stdscr, recommendations):
+def _prompt_confirmation(stdscr, prompt):
+    """Prompt for a y/n confirmation at the bottom of the screen."""
+    height, width = stdscr.getmaxyx()
+    try:
+        stdscr.addstr(height - 1, 0, " " * max(0, width - 1))
+        stdscr.addstr(height - 1, 0, prompt[: width - 1], curses.A_BOLD)
+    except curses.error:
+        pass
+    stdscr.refresh()
+    stdscr.nodelay(False)
+    return stdscr.getch()
+
+
+def _flash_message(stdscr, message, delay_ms=900):
+    """Show a brief status message at the bottom of the screen."""
+    height, width = stdscr.getmaxyx()
+    try:
+        stdscr.addstr(height - 1, 0, " " * max(0, width - 1))
+        stdscr.addstr(height - 1, 0, message[: width - 1], curses.A_BOLD)
+    except curses.error:
+        pass
+    stdscr.refresh()
+    curses.napms(delay_ms)
+
+
+def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None):
     """Fullscreen curses view showing cleanup recommendations."""
     curses.curs_set(0)
     curses.use_default_colors()
@@ -571,8 +580,6 @@ def show_recommendations(stdscr, recommendations):
     curses.init_pair(22, curses.COLOR_RED, -1)     # medium/high
     curses.init_pair(23, curses.COLOR_CYAN, -1)    # header
     curses.init_pair(24, curses.COLOR_WHITE, curses.COLOR_BLUE)  # selected
-    curses.init_pair(25, curses.COLOR_MAGENTA, -1)  # tier header
-
     risk_color = {
         "safe": 20,
         "low": 21,
@@ -592,10 +599,6 @@ def show_recommendations(stdscr, recommendations):
 
     rows = _build_rows(recommendations)
     selected = 0
-    while selected < len(rows) and rows[selected]["kind"] != "item":
-        selected += 1
-    if selected >= len(rows):
-        return
 
     while True:
         stdscr.clear()
@@ -614,61 +617,44 @@ def show_recommendations(stdscr, recommendations):
             pass
 
         visible_area = max(1, height - 5)
+        lines_per_item = 3
+        max_visible_items = max(1, visible_area // lines_per_item)
         scroll_offset = 0
-        item_line = 0
-        for idx, row in enumerate(rows):
-            line_cost = 1 if row["kind"] == "header" else 3
-            if row["kind"] == "item" and idx == selected:
-                break
-            item_line += line_cost
-        while item_line - scroll_offset >= visible_area:
-            scroll_offset += 1
+        if selected >= max_visible_items:
+            scroll_offset = selected - max_visible_items + 1
 
         y = 2
-        item_number = 0
-        consumed = 0
 
-        for idx, row in enumerate(rows):
-            line_cost = 1 if row["kind"] == "header" else 3
-            if consumed + line_cost <= scroll_offset:
-                if row["kind"] == "item":
-                    item_number += 1
-                consumed += line_cost
-                continue
-            if y >= height - 2:
+        for idx in range(scroll_offset, min(len(rows), scroll_offset + max_visible_items)):
+            row = rows[idx]
+            if y + 1 >= height - 2:
                 break
 
-            if row["kind"] == "header":
-                header = f"{row['label']}  ({row['total_human']})"
-                try:
-                    stdscr.addstr(y, 1, header[: width - 2], curses.color_pair(25) | curses.A_BOLD)
-                except curses.error:
-                    pass
-                y += 1
-                consumed += 1
-                continue
-
             rec = row["rec"]
-            item_number += 1
             is_selected = idx == selected
             attr = curses.A_REVERSE if is_selected else 0
             color = curses.color_pair(risk_color.get(rec.risk, 21))
 
             display_path = _shorten_path(rec.path)
+            primary = "{action}: {rationale}".format(
+                action=ACTION_LABELS.get(rec.action, rec.action),
+                rationale=rec.rationale,
+            )
             size_and_badges = "  {size:>6}  [{tier}] {risk}".format(
                 size=rec.size_human,
                 tier=TIER_LABELS.get(rec.tier, rec.tier),
                 risk=RISK_LABELS.get(rec.risk, rec.risk),
             )
-            max_path_len = max(10, width - len(size_and_badges) - 6)
+            max_primary_len = max(10, width - len(size_and_badges) - 6)
+            if len(primary) > max_primary_len:
+                primary = primary[: max_primary_len - 3] + "..."
+
+            max_path_len = max(10, width - 8)
             if len(display_path) > max_path_len:
                 display_path = "..." + display_path[-(max_path_len - 3):]
 
-            line1 = "{num:>2}. {path}".format(num=item_number, path=display_path)
-            line2 = "     {action}: {rationale}".format(
-                action=ACTION_LABELS.get(rec.action, rec.action),
-                rationale=rec.rationale,
-            )
+            line1 = "{num:>2}. {text}".format(num=idx + 1, text=primary)
+            line2 = "     {path}".format(path=display_path)
 
             try:
                 stdscr.addstr(y, 1, line1[: width - 2], curses.A_BOLD | attr)
@@ -696,11 +682,10 @@ def show_recommendations(stdscr, recommendations):
                 pass
 
             y += 3
-            consumed += 3
 
         try:
             footer_y = height - 2
-            footer = "  ↑/↓: Navigate  o: Open in Finder  q: Back"
+            footer = "  ↑/↓: Navigate  x: Move to Trash  o: Open in Finder  q: Back"
             stdscr.addstr(footer_y, 0, "─" * min(width - 1, 72))
             stdscr.addstr(
                 footer_y + 1 if footer_y + 1 < height else footer_y,
@@ -718,20 +703,40 @@ def show_recommendations(stdscr, recommendations):
         if key == ord("q") or key == 27:
             break
         if key == curses.KEY_UP:
-            while selected > 0:
+            if selected > 0:
                 selected -= 1
-                if rows[selected]["kind"] == "item":
-                    break
         elif key == curses.KEY_DOWN:
-            while selected < len(rows) - 1:
+            if selected < len(rows) - 1:
                 selected += 1
-                if rows[selected]["kind"] == "item":
-                    break
         elif key == ord("o"):
             rec = rows[selected]["rec"]
             if os.path.exists(rec.path):
                 curses.endwin()
                 subprocess.run(["open", rec.path], check=False)
                 stdscr.refresh()
+        elif key == ord("x"):
+            rec = rows[selected]["rec"]
+            if not os.path.exists(rec.path):
+                _flash_message(stdscr, "Path no longer exists.")
+                continue
+            prompt = f"Move to Trash? {rec.size_human} {_shorten_path(rec.path)} (y/n)"
+            if rec.action != "delete":
+                prompt = f"Tagged {ACTION_LABELS.get(rec.action, rec.action)}. Move to Trash anyway? (y/n)"
+            confirm = _prompt_confirmation(stdscr, prompt)
+            if confirm != ord("y"):
+                continue
+            try:
+                move_path_to_trash(rec.path)
+                if scan_dir and root_path:
+                    remove_path_from_scan(scan_dir, root_path, rec.path)
+                    recommendations = generate_recommendations(scan_dir, root_path)
+                    rows = _build_rows(recommendations)
+                    if not rows:
+                        _flash_message(stdscr, "Item moved to Trash. No recommendations remain.")
+                        break
+                    selected = min(selected, len(rows) - 1)
+                _flash_message(stdscr, "Moved to Trash.")
+            except Exception as exc:
+                _flash_message(stdscr, f"Trash failed: {exc}")
         elif key == curses.KEY_RESIZE:
             pass

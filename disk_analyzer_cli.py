@@ -642,7 +642,7 @@ def run_recommend_tui(stdscr, config):
         return
     scan_dir = os.path.join(output_dir, browser.timestamp_dir)
     recommendations = generate_recommendations(scan_dir, browser.current_path)
-    show_recommendations(stdscr, recommendations)
+    show_recommendations(stdscr, recommendations, scan_dir=scan_dir, root_path=browser.current_path)
 
 
 def cmd_scan(args):

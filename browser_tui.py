@@ -9,6 +9,7 @@ import threading
 import time
 
 from disk_analyzer import run_du_command, filter_excluded_entries
+from file_actions import move_path_to_trash, remove_path_from_scan
 
 # Color pair IDs for percentage thresholds
 COLOR_PCT_1 = 1   # 2.5-5%
@@ -280,6 +281,35 @@ class OutputBrowser:
         except Exception as e:
             self.log(f"Error opening Finder: {str(e)}")
             return False
+
+    def _current_disk_usage_file(self):
+        """Return the mirrored disk_usage.txt path for the current browser view."""
+        if os.path.normpath(self.current_path) == os.path.normpath(self.root_path):
+            return os.path.join(self.output_dir, self.timestamp_dir, "disk_usage.txt")
+
+        rel_path = os.path.relpath(self.current_path, self.root_path)
+        return os.path.join(self.output_dir, self.timestamp_dir, rel_path, "disk_usage.txt")
+
+    def _reload_current_view(self):
+        """Reload the current browser view from the mirrored scan snapshot."""
+        disk_usage_path = self._current_disk_usage_file()
+        if not os.path.exists(disk_usage_path):
+            return False
+
+        data = []
+        with open(disk_usage_path) as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) == 2:
+                    data.append((parts[0], parts[1]))
+
+        if not data:
+            return False
+
+        self.disk_usage_data = data
+        if os.path.normpath(self.current_path) == os.path.normpath(self.root_path):
+            self.root_size_bytes = self.parse_size_to_bytes(data[0][0])
+        return True
 
     def _rescan_worker(self, target_path):
         """Background worker: run du on target_path and store the result."""
@@ -677,7 +707,7 @@ class OutputBrowser:
                         scan_footer = f" {spinner} Rescanning {target_name}... {elapsed:.0f}s elapsed (c: cancel)"
                     stdscr.addstr(footer_pos, 0, scan_footer[:width-1], curses.A_BOLD | curses.color_pair(COLOR_SCAN))
                 else:
-                    footer = "↑/↓: Navigate, Enter: Select, s: Rescan, d: Recommend, o: Finder, r: Select run, q: Quit"
+                    footer = "↑/↓: Navigate, Enter: Select, s: Rescan, d: Recommend, x: Trash, o: Finder, r: Select run, q: Quit"
                     stdscr.addstr(footer_pos, 0, footer[:width-1], curses.A_BOLD)
             except curses.error:
                 pass
@@ -745,8 +775,32 @@ class OutputBrowser:
                 from cleanup_recommendations import generate_recommendations, show_recommendations
                 scan_dir = os.path.join(self.output_dir, self.timestamp_dir)
                 recs = generate_recommendations(scan_dir, self.root_path)
-                show_recommendations(stdscr, recs)
+                show_recommendations(stdscr, recs, scan_dir=scan_dir, root_path=self.root_path)
                 continue
+            elif key == ord('x') and not self.is_scanning():
+                if options and 0 <= self.selected_idx < len(options):
+                    name, sel_path, _, _ = options[self.selected_idx]
+                    if name == ".. (Parent Directory)":
+                        continue
+                    if not os.path.exists(sel_path):
+                        self.show_message(stdscr, "Path no longer exists.\nPress any key to continue.")
+                        stdscr.getch()
+                        continue
+                    prompt = f"Move to Trash?\n\n{sel_path}\n\nPress y to confirm, any other key to cancel."
+                    self.show_message(stdscr, prompt)
+                    if stdscr.getch() != ord('y'):
+                        continue
+                    try:
+                        move_path_to_trash(sel_path)
+                        scan_dir = os.path.join(self.output_dir, self.timestamp_dir)
+                        remove_path_from_scan(scan_dir, self.root_path, sel_path)
+                        self._reload_current_view()
+                        self.selected_idx = min(self.selected_idx, max(0, len(options) - 2))
+                        self.show_message(stdscr, "Moved to Trash.\nPress any key to continue.")
+                    except Exception as exc:
+                        self.show_message(stdscr, f"Move to Trash failed:\n{exc}\n\nPress any key to continue.")
+                    stdscr.getch()
+                    continue
             elif key == ord('o'):
                 # Open current directory in Finder
                 if os.path.exists(self.current_path):
