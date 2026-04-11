@@ -77,6 +77,12 @@ RISK_LABELS = {
 
 MAX_RECOMMENDATIONS = 100
 MIN_RECOMMENDATION_BYTES = 100 * 1024 * 1024
+SORT_LADDER = "ladder"
+SORT_SIZE = "size"
+SORT_LABELS = {
+    SORT_LADDER: "Ease",
+    SORT_SIZE: "Size",
+}
 
 
 # ── Rules ────────────────────────────────────────────────────────────────────
@@ -543,6 +549,16 @@ def _build_rows(recommendations):
     return [{"kind": "item", "rec": rec} for rec in recommendations]
 
 
+def _sort_recommendations(recommendations, sort_mode):
+    """Return recommendations ordered for the requested sort mode."""
+    if sort_mode == SORT_SIZE:
+        return sorted(
+            recommendations,
+            key=lambda rec: (-rec.size_bytes, RISK_ORDER.get(rec.risk, 99), rec.path),
+        )
+    return sorted(recommendations, key=_sort_key)
+
+
 # ── TUI Display ──────────────────────────────────────────────────────────────
 
 def _prompt_confirmation(stdscr, prompt):
@@ -597,18 +613,20 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
         stdscr.getch()
         return
 
-    rows = _build_rows(recommendations)
+    sort_mode = SORT_LADDER
+    ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
+    rows = _build_rows(ordered_recommendations)
     selected = 0
 
     while True:
         stdscr.clear()
         height, width = stdscr.getmaxyx()
 
-        total_bytes = sum(rec.size_bytes for rec in recommendations)
+        total_bytes = sum(rec.size_bytes for rec in ordered_recommendations)
         total_human = _format_bytes(total_bytes)
 
         title = "Opportunity Ladder"
-        total_label = f"Shown: {total_human}"
+        total_label = f"Sort: {SORT_LABELS[sort_mode]}  Shown: {total_human}"
         try:
             stdscr.addstr(0, 1, title, curses.color_pair(23) | curses.A_BOLD)
             stdscr.addstr(0, max(1, width - len(total_label) - 1), total_label, curses.A_BOLD)
@@ -640,44 +658,42 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 action=ACTION_LABELS.get(rec.action, rec.action),
                 rationale=rec.rationale,
             )
-            size_and_badges = "  {size:>6}  [{tier}] {risk}".format(
-                size=rec.size_human,
-                tier=TIER_LABELS.get(rec.tier, rec.tier),
-                risk=RISK_LABELS.get(rec.risk, rec.risk),
-            )
-            max_primary_len = max(10, width - len(size_and_badges) - 6)
+            num_col = "{num:>2}.".format(num=idx + 1)
+            size_col = "{size:>6}".format(size=rec.size_human)
+            risk_col = "{risk:<13}".format(risk=RISK_LABELS.get(rec.risk, rec.risk))
+            tier_col = "{tier:<18}".format(tier="[{}]".format(TIER_LABELS.get(rec.tier, rec.tier)))
+
+            num_x = 1
+            size_x = num_x + 4
+            risk_x = size_x + 8
+            tier_x = risk_x + 14
+            desc_x = tier_x + 19
+
+            max_primary_len = max(10, width - desc_x - 1)
             if len(primary) > max_primary_len:
                 primary = primary[: max_primary_len - 3] + "..."
 
-            max_path_len = max(10, width - 8)
+            max_path_len = max(10, width - desc_x - 1)
             if len(display_path) > max_path_len:
                 display_path = "..." + display_path[-(max_path_len - 3):]
 
-            line1 = "{num:>2}. {text}".format(num=idx + 1, text=primary)
-            line2 = "     {path}".format(path=display_path)
-
             try:
-                stdscr.addstr(y, 1, line1[: width - 2], curses.A_BOLD | attr)
-                badge_x = max(len(line1) + 2, width - len(size_and_badges) - 1)
-                if badge_x + len(size_and_badges) < width:
-                    stdscr.addstr(y, badge_x, "  {0:>6}  ".format(rec.size_human), attr)
-                    tier_label = "[{0}]".format(TIER_LABELS.get(rec.tier, rec.tier))
+                if num_x + len(num_col) < width:
+                    stdscr.addstr(y, num_x, num_col, curses.A_BOLD | attr)
+                if size_x + len(size_col) < width:
+                    stdscr.addstr(y, size_x, size_col, curses.A_BOLD | attr)
+                if risk_x + len(risk_col) < width:
+                    stdscr.addstr(y, risk_x, risk_col, color | attr)
+                if tier_x + len(tier_col) < width:
                     stdscr.addstr(
                         y,
-                        badge_x + len("  {0:>6}  ".format(rec.size_human)),
-                        tier_label,
+                        tier_x,
+                        tier_col,
                         curses.color_pair(23) | attr,
                     )
-                    risk_x = badge_x + len("  {0:>6}  ".format(rec.size_human)) + len(tier_label) + 1
-                    if risk_x + len(RISK_LABELS.get(rec.risk, rec.risk)) < width:
-                        stdscr.addstr(
-                            y,
-                            risk_x,
-                            RISK_LABELS.get(rec.risk, rec.risk),
-                            color | attr,
-                        )
-
-                stdscr.addstr(y + 1, 1, line2[: width - 2], curses.A_DIM | attr)
+                if desc_x < width:
+                    stdscr.addstr(y, desc_x, primary[: width - desc_x - 1], curses.A_BOLD | attr)
+                    stdscr.addstr(y + 1, desc_x, display_path[: width - desc_x - 1], curses.A_DIM | attr)
             except curses.error:
                 pass
 
@@ -685,7 +701,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
 
         try:
             footer_y = height - 2
-            footer = "  ↑/↓: Navigate  x: Move to Trash  o: Open in Finder  q: Back"
+            footer = "  ↑/↓: Navigate  t: Toggle sort  x: Move to Trash  o: Open in Finder  q: Back"
             stdscr.addstr(footer_y, 0, "─" * min(width - 1, 72))
             stdscr.addstr(
                 footer_y + 1 if footer_y + 1 < height else footer_y,
@@ -714,6 +730,15 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 curses.endwin()
                 subprocess.run(["open", rec.path], check=False)
                 stdscr.refresh()
+        elif key == ord("t"):
+            selected_path = rows[selected]["rec"].path
+            sort_mode = SORT_SIZE if sort_mode == SORT_LADDER else SORT_LADDER
+            ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
+            rows = _build_rows(ordered_recommendations)
+            for idx, row in enumerate(rows):
+                if row["rec"].path == selected_path:
+                    selected = idx
+                    break
         elif key == ord("x"):
             rec = rows[selected]["rec"]
             if not os.path.exists(rec.path):
@@ -730,7 +755,8 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 if scan_dir and root_path:
                     remove_path_from_scan(scan_dir, root_path, rec.path)
                     recommendations = generate_recommendations(scan_dir, root_path)
-                    rows = _build_rows(recommendations)
+                    ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
+                    rows = _build_rows(ordered_recommendations)
                     if not rows:
                         _flash_message(stdscr, "Item moved to Trash. No recommendations remain.")
                         break
