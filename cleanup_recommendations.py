@@ -41,6 +41,118 @@ def _save_reviewed_paths(scan_dir, reviewed):
     with open(path, "w") as f:
         json.dump(sorted(reviewed), f, indent=2)
 
+
+PREFERENCES_DIR = os.path.expanduser("~/.config/disk-analyzer")
+PREFERENCES_FILE = os.path.join(PREFERENCES_DIR, "preferences.json")
+ACTIVE_PROJECTS_FILE = os.path.join(PREFERENCES_DIR, "active_projects.json")
+
+
+def _load_active_projects():
+    if not os.path.exists(ACTIVE_PROJECTS_FILE):
+        return set()
+    try:
+        with open(ACTIVE_PROJECTS_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return {os.path.normpath(p) for p in data}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return set()
+
+
+def _save_active_projects(projects):
+    os.makedirs(PREFERENCES_DIR, exist_ok=True)
+    with open(ACTIVE_PROJECTS_FILE, "w") as f:
+        json.dump(sorted(projects), f, indent=2)
+
+
+def _is_under_active_project(path, active_projects):
+    norm = os.path.normpath(path)
+    for root in active_projects:
+        if norm == root or norm.startswith(root + os.sep):
+            return True
+    return False
+
+
+def _active_project_root_for_path(path):
+    """For venv/node_modules rows, return the parent project dir. Otherwise return the path as-is."""
+    norm = os.path.normpath(path)
+    base = os.path.basename(norm)
+    if base == "node_modules" or base in {"venv", ".venv", "env", ".env"}:
+        parent = os.path.dirname(norm)
+        return parent or norm
+    return norm
+
+VENV_AI_PROMPT = (
+    "please see if requirements.txt reflects the venv packages; if not, "
+    "please make it so. and make a .python-version with the python version "
+    "from the venv."
+)
+
+AI_AGENTS = {
+    "claude": "claude",
+    "codex": "codex",
+}
+
+
+def _load_preferences():
+    if not os.path.exists(PREFERENCES_FILE):
+        return {}
+    try:
+        with open(PREFERENCES_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_preferences(prefs):
+    os.makedirs(PREFERENCES_DIR, exist_ok=True)
+    with open(PREFERENCES_FILE, "w") as f:
+        json.dump(prefs, f, indent=2)
+
+
+def _node_modules_lockfile(node_modules_path):
+    """Return the path of a sibling lockfile if one exists, else None."""
+    parent = os.path.dirname(os.path.normpath(node_modules_path))
+    for name in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock"):
+        candidate = os.path.join(parent, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _venv_requirements_file(venv_path):
+    """Return the path to a sibling requirements.txt / pyproject.toml if present."""
+    parent = os.path.dirname(os.path.normpath(venv_path))
+    for name in ("requirements.txt", "pyproject.toml", "Pipfile", "poetry.lock"):
+        candidate = os.path.join(parent, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _looks_like_venv(path):
+    base = os.path.basename(os.path.normpath(path))
+    if base in {"venv", ".venv", "env", ".env"}:
+        return True
+    if os.path.isfile(os.path.join(path, "pyvenv.cfg")):
+        return True
+    return False
+
+
+def _launch_ai_agent_for_venv(agent, venv_path):
+    """Open a new Terminal.app window in the venv's parent and run the agent."""
+    import shlex
+
+    project_dir = os.path.dirname(os.path.normpath(venv_path)) or "/"
+    cmd = AI_AGENTS.get(agent, agent)
+    full_cmd = f"cd {shlex.quote(project_dir)} && {cmd} {shlex.quote(VENV_AI_PROMPT)}"
+    osa_escaped = full_cmd.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'tell application "Terminal" to do script "{osa_escaped}"\n'
+    script += 'tell application "Terminal" to activate'
+    subprocess.run(["osascript", "-e", script], check=False)
+
 from disk_analyzer import parse_size, _format_bytes
 from file_actions import (
     measure_path_size_bytes,
@@ -102,6 +214,7 @@ ACTION_LABELS = {
     "review": "Review",
     "archive": "Archive",
     "ignore": "Ignore",
+    "keep": "Keep",
 }
 
 RISK_LABELS = {
@@ -539,10 +652,13 @@ def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
 
     seen_paths = _load_seen_paths(scan_dir)
     reviewed = _load_reviewed_paths(scan_dir)
+    active_projects = _load_active_projects()
 
     candidates = []
     for path, (size_bytes, _size_str) in seen_paths.items():
         if size_bytes < MIN_RECOMMENDATION_BYTES:
+            continue
+        if _is_under_active_project(path, active_projects):
             continue
         if only_reviewed:
             if path not in reviewed:
@@ -551,17 +667,37 @@ def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
             continue
         for rule in CLEANUP_RULES:
             if fnmatch.fnmatch(path, rule.pattern):
+                risk = rule.risk
+                tier = rule.tier
+                rationale = rule.rationale
+                regeneration = rule.regeneration
+                basename = os.path.basename(os.path.normpath(path))
+                if basename == "node_modules":
+                    lockfile = _node_modules_lockfile(path)
+                    if lockfile:
+                        risk = "safe"
+                        rationale = f"JavaScript dependencies — {os.path.basename(lockfile)} present, restorable exactly"
+                    else:
+                        risk = "medium"
+                        tier = "reviewable_state"
+                        rationale = "JavaScript dependencies — no lockfile in parent, review before deleting"
+                elif basename in {"venv", ".venv", "env", ".env"} or os.path.isfile(os.path.join(path, "pyvenv.cfg")):
+                    req = _venv_requirements_file(path)
+                    if not req:
+                        risk = "medium"
+                        tier = "reviewable_state"
+                        rationale = "Python venv — no requirements/pyproject in parent, review before deleting"
                 candidates.append(
                     Recommendation(
                         path=path,
                         size_bytes=size_bytes,
                         size_human=_format_bytes(size_bytes),
                         category=rule.category,
-                        tier=rule.tier,
-                        risk=rule.risk,
+                        tier=tier,
+                        risk=risk,
                         action=rule.action,
-                        rationale=rule.rationale,
-                        regeneration=rule.regeneration,
+                        rationale=rationale,
+                        regeneration=regeneration,
                     )
                 )
                 break
@@ -589,6 +725,29 @@ def _shorten_path(path):
 def _build_rows(recommendations):
     """Build a flat render list for the current sort order."""
     return [{"kind": "item", "rec": rec} for rec in recommendations]
+
+
+def _build_active_project_recommendations(active_projects, scan_dir):
+    """Synthesize Recommendation rows for the active-projects view."""
+    seen_paths = _load_seen_paths(scan_dir) if scan_dir else {}
+    recs = []
+    for root in sorted(active_projects):
+        size_bytes, _ = seen_paths.get(root, (0, ""))
+        recs.append(
+            Recommendation(
+                path=root,
+                size_bytes=size_bytes,
+                size_human=_format_bytes(size_bytes) if size_bytes else "—",
+                category="active_project",
+                tier="reviewable_state",
+                risk="safe",
+                action="keep",
+                rationale="Active project — excluded from recommendations",
+                regeneration="",
+            )
+        )
+    recs.sort(key=lambda r: (-r.size_bytes, r.path))
+    return recs
 
 
 def _sort_recommendations(recommendations, sort_mode):
@@ -646,7 +805,8 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
     }
 
     has_any_reviewed = bool(_load_reviewed_paths(scan_dir)) if scan_dir else False
-    if not recommendations and not has_any_reviewed:
+    has_any_active = bool(_load_active_projects())
+    if not recommendations and not has_any_reviewed and not has_any_active:
         stdscr.clear()
         stdscr.addstr(2, 2, "No cleanup recommendations found.", curses.A_BOLD)
         stdscr.addstr(4, 2, "Run a scan first, or scan with a lower min-size threshold.")
@@ -656,11 +816,20 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
         stdscr.getch()
         return
 
-    view_mode = "active"  # or "reviewed"
+    view_mode = "active"  # or "reviewed" or "active_projects"
     sort_mode = SORT_LADDER
     ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
     rows = _build_rows(ordered_recommendations)
     selected = 0
+
+    def rebuild_rows(current_sort, current_view):
+        if current_view == "active_projects":
+            synth = _build_active_project_recommendations(_load_active_projects(), scan_dir)
+            return synth, synth, _build_rows(synth)
+        only_reviewed = current_view == "reviewed"
+        recs = generate_recommendations(scan_dir, root_path, only_reviewed=only_reviewed)
+        ordered = _sort_recommendations(recs, current_sort)
+        return recs, ordered, _build_rows(ordered)
 
     while True:
         stdscr.clear()
@@ -669,7 +838,12 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
         total_bytes = sum(rec.size_bytes for rec in ordered_recommendations)
         total_human = _format_bytes(total_bytes)
 
-        title = "Opportunity Ladder — Reviewed" if view_mode == "reviewed" else "Opportunity Ladder"
+        if view_mode == "reviewed":
+            title = "Opportunity Ladder — Reviewed"
+        elif view_mode == "active_projects":
+            title = "Opportunity Ladder — Active Projects"
+        else:
+            title = "Opportunity Ladder"
         total_label = f"Sort: {SORT_LABELS[sort_mode]}  Shown: {total_human}"
         try:
             stdscr.addstr(0, 1, title, curses.color_pair(23) | curses.A_BOLD)
@@ -745,11 +919,12 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
 
         try:
             footer_y = height - 2
-            footer = (
-                "  ↑/↓: Nav  t: Sort  r: Rescan  m: Unreview  V: Active  x: Trash  q: Back"
-                if view_mode == "reviewed"
-                else "  ↑/↓: Nav  t: Sort  r: Rescan  m: Review  V: Reviewed  x: Trash  q: Back"
-            )
+            if view_mode == "reviewed":
+                footer = "  ↑/↓: Nav  t: Sort  m: Unreview  p: Active-proj  V: Active  P: Projects  q: Back"
+            elif view_mode == "active_projects":
+                footer = "  ↑/↓: Nav  p: Unmark project  o: Finder  P: Back to Active  q: Back"
+            else:
+                footer = "  ↑/↓: Nav  t: Sort  r: Rescan  a: AI  m: Review  p: Project  V: Reviewed  P: Projects  x: Trash  q: Back"
             stdscr.addstr(footer_y, 0, "─" * min(width - 1, 72))
             stdscr.addstr(
                 footer_y + 1 if footer_y + 1 < height else footer_y,
@@ -768,10 +943,12 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             break
         if key == ord("V"):
             view_mode = "active" if view_mode == "reviewed" else "reviewed"
-            only_reviewed = view_mode == "reviewed"
-            recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=only_reviewed)
-            ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
-            rows = _build_rows(ordered_recommendations)
+            recommendations, ordered_recommendations, rows = rebuild_rows(sort_mode, view_mode)
+            selected = 0
+            continue
+        if key == ord("P"):
+            view_mode = "active" if view_mode == "active_projects" else "active_projects"
+            recommendations, ordered_recommendations, rows = rebuild_rows(sort_mode, view_mode)
             selected = 0
             continue
         if not rows:
@@ -801,6 +978,41 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 curses.endwin()
                 subprocess.run(["open", rec.path], check=False)
                 stdscr.refresh()
+        elif key == ord("a"):
+            rec = rows[selected]["rec"]
+            if not os.path.isdir(rec.path) or not _looks_like_venv(rec.path):
+                _flash_message(stdscr, "AI-analyze only supports Python venvs right now.")
+                continue
+            prefs = _load_preferences()
+            agent = prefs.get("ai_agent")
+            ask_remember = False
+            if agent not in AI_AGENTS:
+                choice = _prompt_confirmation(
+                    stdscr, "AI agent? (c)laude / (x) codex / (esc) cancel"
+                )
+                if choice == ord("c"):
+                    agent = "claude"
+                elif choice == ord("x"):
+                    agent = "codex"
+                else:
+                    continue
+                ask_remember = True
+            if ask_remember:
+                remember = _prompt_confirmation(
+                    stdscr, f"Remember '{agent}' for next time? (y/n)"
+                )
+                if remember == ord("y"):
+                    prefs["ai_agent"] = agent
+                    try:
+                        _save_preferences(prefs)
+                    except OSError as exc:
+                        _flash_message(stdscr, f"Could not save preference: {exc}")
+            try:
+                _launch_ai_agent_for_venv(agent, rec.path)
+                _flash_message(stdscr, f"Launched {agent} in Terminal.")
+            except Exception as exc:
+                _flash_message(stdscr, f"Launch failed: {exc}")
+            continue
         elif key == ord("t"):
             selected_path = rows[selected]["rec"].path
             sort_mode = SORT_SIZE if sort_mode == SORT_LADDER else SORT_LADDER
@@ -831,6 +1043,26 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 _flash_message(stdscr, msg)
             except Exception as exc:
                 _flash_message(stdscr, f"Rescan failed: {exc}")
+            continue
+        elif key == ord("p"):
+            rec = rows[selected]["rec"]
+            try:
+                projects = _load_active_projects()
+                if view_mode == "active_projects":
+                    projects.discard(os.path.normpath(rec.path))
+                    _save_active_projects(projects)
+                    msg = "Unmarked active project."
+                else:
+                    root = _active_project_root_for_path(rec.path)
+                    projects.add(root)
+                    _save_active_projects(projects)
+                    msg = f"Active project: {_shorten_path(root)}"
+                recommendations, ordered_recommendations, rows = rebuild_rows(sort_mode, view_mode)
+                if rows:
+                    selected = min(selected, len(rows) - 1)
+                _flash_message(stdscr, msg)
+            except Exception as exc:
+                _flash_message(stdscr, f"Active-project update failed: {exc}")
             continue
         elif key == ord("m"):
             rec = rows[selected]["rec"]
