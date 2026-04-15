@@ -65,7 +65,15 @@ disk-analyzer scan /path/to/dir --min-size 1 --sudo --quiet
 # Browse previous results
 disk-analyzer browse
 disk-analyzer browse --output /path/to/output
+
+# Jump straight to the opportunity ladder for the most recent scan
+disk-analyzer --latest-recommendations
 ```
+
+The `--latest-recommendations` flag short-circuits past the main menu and the
+scan picker, opening the ladder directly against the newest timestamp
+directory in your output folder. Handy when you already scanned earlier and
+just want to keep working through the recommendations.
 
 ### Scan Options
 

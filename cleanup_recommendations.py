@@ -6,12 +6,48 @@ Scans analysis output for known cleanup opportunities and ranks them as an
 
 import curses
 import fnmatch
+import json
 import os
 import subprocess
 from collections import namedtuple
 
+REVIEWED_FILE = "reviewed_paths.json"
+
+
+def _reviewed_file_path(scan_dir):
+    return os.path.join(scan_dir, REVIEWED_FILE)
+
+
+def _load_reviewed_paths(scan_dir):
+    if not scan_dir:
+        return set()
+    path = _reviewed_file_path(scan_dir)
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set(data)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return set()
+
+
+def _save_reviewed_paths(scan_dir, reviewed):
+    if not scan_dir:
+        return
+    path = _reviewed_file_path(scan_dir)
+    with open(path, "w") as f:
+        json.dump(sorted(reviewed), f, indent=2)
+
 from disk_analyzer import parse_size, _format_bytes
-from file_actions import move_path_to_trash, remove_path_from_scan
+from file_actions import (
+    measure_path_size_bytes,
+    move_path_to_trash,
+    remove_path_from_scan,
+    update_path_size_in_scan,
+)
 
 CleanupRule = namedtuple(
     "CleanupRule",
@@ -488,7 +524,7 @@ def _sort_key(rec):
     )
 
 
-def generate_recommendations(scan_dir, root_path=None):
+def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
     """Walk scan output and match paths against opportunity ladder rules.
 
     Args:
@@ -502,10 +538,16 @@ def generate_recommendations(scan_dir, root_path=None):
     del root_path  # kept for backwards compatibility with existing callers
 
     seen_paths = _load_seen_paths(scan_dir)
+    reviewed = _load_reviewed_paths(scan_dir)
 
     candidates = []
     for path, (size_bytes, _size_str) in seen_paths.items():
         if size_bytes < MIN_RECOMMENDATION_BYTES:
+            continue
+        if only_reviewed:
+            if path not in reviewed:
+                continue
+        elif path in reviewed:
             continue
         for rule in CLEANUP_RULES:
             if fnmatch.fnmatch(path, rule.pattern):
@@ -603,7 +645,8 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
         "high": 22,
     }
 
-    if not recommendations:
+    has_any_reviewed = bool(_load_reviewed_paths(scan_dir)) if scan_dir else False
+    if not recommendations and not has_any_reviewed:
         stdscr.clear()
         stdscr.addstr(2, 2, "No cleanup recommendations found.", curses.A_BOLD)
         stdscr.addstr(4, 2, "Run a scan first, or scan with a lower min-size threshold.")
@@ -613,6 +656,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
         stdscr.getch()
         return
 
+    view_mode = "active"  # or "reviewed"
     sort_mode = SORT_LADDER
     ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
     rows = _build_rows(ordered_recommendations)
@@ -625,7 +669,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
         total_bytes = sum(rec.size_bytes for rec in ordered_recommendations)
         total_human = _format_bytes(total_bytes)
 
-        title = "Opportunity Ladder"
+        title = "Opportunity Ladder — Reviewed" if view_mode == "reviewed" else "Opportunity Ladder"
         total_label = f"Sort: {SORT_LABELS[sort_mode]}  Shown: {total_human}"
         try:
             stdscr.addstr(0, 1, title, curses.color_pair(23) | curses.A_BOLD)
@@ -701,7 +745,11 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
 
         try:
             footer_y = height - 2
-            footer = "  ↑/↓: Navigate  t: Toggle sort  x: Move to Trash  o: Open in Finder  q: Back"
+            footer = (
+                "  ↑/↓: Nav  t: Sort  r: Rescan  m: Unreview  V: Active  x: Trash  q: Back"
+                if view_mode == "reviewed"
+                else "  ↑/↓: Nav  t: Sort  r: Rescan  m: Review  V: Reviewed  x: Trash  q: Back"
+            )
             stdscr.addstr(footer_y, 0, "─" * min(width - 1, 72))
             stdscr.addstr(
                 footer_y + 1 if footer_y + 1 < height else footer_y,
@@ -718,12 +766,35 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
 
         if key == ord("q") or key == 27:
             break
+        if key == ord("V"):
+            view_mode = "active" if view_mode == "reviewed" else "reviewed"
+            only_reviewed = view_mode == "reviewed"
+            recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=only_reviewed)
+            ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
+            rows = _build_rows(ordered_recommendations)
+            selected = 0
+            continue
+        if not rows:
+            try:
+                stdscr.addstr(
+                    height // 2,
+                    2,
+                    "Nothing to show here. Press V to toggle view, q to back out.",
+                    curses.A_DIM,
+                )
+            except curses.error:
+                pass
+            continue
         if key == curses.KEY_UP:
             if selected > 0:
                 selected -= 1
         elif key == curses.KEY_DOWN:
             if selected < len(rows) - 1:
                 selected += 1
+        elif key == curses.KEY_PPAGE:
+            selected = max(0, selected - max_visible_items)
+        elif key == curses.KEY_NPAGE:
+            selected = min(len(rows) - 1, selected + max_visible_items)
         elif key == ord("o"):
             rec = rows[selected]["rec"]
             if os.path.exists(rec.path):
@@ -739,10 +810,67 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 if row["rec"].path == selected_path:
                     selected = idx
                     break
+        elif key == ord("r"):
+            rec = rows[selected]["rec"]
+            if not scan_dir or not root_path:
+                _flash_message(stdscr, "Cannot rescan: scan context unavailable.")
+                continue
+            try:
+                if not os.path.exists(rec.path):
+                    remove_path_from_scan(scan_dir, root_path, rec.path)
+                    msg = "Path gone — removed from scan."
+                else:
+                    new_size = measure_path_size_bytes(rec.path)
+                    update_path_size_in_scan(scan_dir, root_path, rec.path, new_size)
+                    msg = f"Rescanned: {_format_bytes(new_size)}"
+                recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
+                ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
+                rows = _build_rows(ordered_recommendations)
+                if rows:
+                    selected = min(selected, len(rows) - 1)
+                _flash_message(stdscr, msg)
+            except Exception as exc:
+                _flash_message(stdscr, f"Rescan failed: {exc}")
+            continue
+        elif key == ord("m"):
+            rec = rows[selected]["rec"]
+            if not scan_dir:
+                _flash_message(stdscr, "Cannot update reviewed: no scan directory.")
+                continue
+            try:
+                reviewed = _load_reviewed_paths(scan_dir)
+                if view_mode == "reviewed":
+                    reviewed.discard(rec.path)
+                    msg = "Unmarked."
+                else:
+                    reviewed.add(rec.path)
+                    msg = "Marked reviewed."
+                _save_reviewed_paths(scan_dir, reviewed)
+                recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
+                ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
+                rows = _build_rows(ordered_recommendations)
+                if rows:
+                    selected = min(selected, len(rows) - 1)
+                _flash_message(stdscr, msg)
+            except Exception as exc:
+                _flash_message(stdscr, f"Update failed: {exc}")
+            continue
         elif key == ord("x"):
             rec = rows[selected]["rec"]
             if not os.path.exists(rec.path):
-                _flash_message(stdscr, "Path no longer exists.")
+                if scan_dir and root_path:
+                    try:
+                        remove_path_from_scan(scan_dir, root_path, rec.path)
+                        recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
+                        ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
+                        rows = _build_rows(ordered_recommendations)
+                        if rows:
+                            selected = min(selected, len(rows) - 1)
+                        _flash_message(stdscr, "Path already gone — removed from list.")
+                    except Exception as exc:
+                        _flash_message(stdscr, f"Path gone; cleanup failed: {exc}")
+                else:
+                    _flash_message(stdscr, "Path no longer exists.")
                 continue
             prompt = f"Move to Trash? {rec.size_human} {_shorten_path(rec.path)} (y/n)"
             if rec.action != "delete":
@@ -754,13 +882,11 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 move_path_to_trash(rec.path)
                 if scan_dir and root_path:
                     remove_path_from_scan(scan_dir, root_path, rec.path)
-                    recommendations = generate_recommendations(scan_dir, root_path)
+                    recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
                     ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
                     rows = _build_rows(ordered_recommendations)
-                    if not rows:
-                        _flash_message(stdscr, "Item moved to Trash. No recommendations remain.")
-                        break
-                    selected = min(selected, len(rows) - 1)
+                    if rows:
+                        selected = min(selected, len(rows) - 1)
                 _flash_message(stdscr, "Moved to Trash.")
             except Exception as exc:
                 _flash_message(stdscr, f"Trash failed: {exc}")

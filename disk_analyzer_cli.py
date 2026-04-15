@@ -692,10 +692,52 @@ def cmd_browse(args):
             pass
 
 
+def run_latest_recommendations(stdscr, config):
+    """Short-circuit to recommendations for the most recent scan."""
+    from browser_tui import OutputBrowser
+    from cleanup_recommendations import generate_recommendations, show_recommendations
+
+    output_dir = get_output_dir(config)
+    browser = OutputBrowser(output_dir)
+    timestamps = browser.load_timestamps()
+    if not timestamps:
+        stdscr.clear()
+        stdscr.addstr(1, 2, "No scans found.", curses.A_BOLD)
+        stdscr.addstr(3, 2, "Run a scan first. Press any key to exit.")
+        stdscr.refresh()
+        stdscr.getch()
+        return
+
+    latest_dir = timestamps[0][0]
+    browser.timestamp_dir = latest_dir
+    browser.current_timestamp = latest_dir
+    disk_usage = browser.load_disk_usage_file(latest_dir)
+    if not disk_usage:
+        stdscr.clear()
+        stdscr.addstr(1, 2, "Latest scan has no disk_usage.txt.", curses.A_BOLD)
+        stdscr.addstr(3, 2, "Press any key to exit.")
+        stdscr.refresh()
+        stdscr.getch()
+        return
+
+    root_path = disk_usage[0][1]
+    browser.current_path = root_path
+    browser.root_path = root_path
+
+    scan_dir = os.path.join(output_dir, latest_dir)
+    recommendations = generate_recommendations(scan_dir, root_path)
+    show_recommendations(stdscr, recommendations, scan_dir=scan_dir, root_path=root_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="disk-analyzer",
         description="Analyze and explore disk usage.",
+    )
+    parser.add_argument(
+        "--latest-recommendations",
+        action="store_true",
+        help="Jump straight to the opportunity ladder for the most recent scan.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -731,6 +773,12 @@ def main():
         cmd_scan(args)
     elif args.command == "browse":
         cmd_browse(args)
+    elif args.latest_recommendations:
+        config = load_config()
+        try:
+            curses.wrapper(run_latest_recommendations, config)
+        except KeyboardInterrupt:
+            pass
     else:
         # No subcommand → launch TUI main menu
         try:
