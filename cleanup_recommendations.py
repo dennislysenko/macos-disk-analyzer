@@ -122,14 +122,25 @@ def _node_modules_lockfile(node_modules_path):
     return None
 
 
-def _venv_requirements_file(venv_path):
-    """Return the path to a sibling requirements.txt / pyproject.toml if present."""
+VENV_LOCKFILES = ("uv.lock", "poetry.lock", "Pipfile.lock")
+VENV_MANIFESTS = ("requirements.txt", "pyproject.toml", "Pipfile")
+
+
+def _venv_dependency_file(venv_path):
+    """Return (path, is_lockfile) for the strongest dep descriptor in the parent.
+
+    Lockfiles beat manifests; returns (None, False) if nothing is found.
+    """
     parent = os.path.dirname(os.path.normpath(venv_path))
-    for name in ("requirements.txt", "pyproject.toml", "Pipfile", "poetry.lock"):
+    for name in VENV_LOCKFILES:
         candidate = os.path.join(parent, name)
         if os.path.isfile(candidate):
-            return candidate
-    return None
+            return candidate, True
+    for name in VENV_MANIFESTS:
+        candidate = os.path.join(parent, name)
+        if os.path.isfile(candidate):
+            return candidate, False
+    return None, False
 
 
 def _looks_like_venv(path):
@@ -682,11 +693,14 @@ def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
                         tier = "reviewable_state"
                         rationale = "JavaScript dependencies — no lockfile in parent, review before deleting"
                 elif basename in {"venv", ".venv", "env", ".env"} or os.path.isfile(os.path.join(path, "pyvenv.cfg")):
-                    req = _venv_requirements_file(path)
-                    if not req:
+                    dep_file, is_lock = _venv_dependency_file(path)
+                    if not dep_file:
                         risk = "medium"
                         tier = "reviewable_state"
                         rationale = "Python venv — no requirements/pyproject in parent, review before deleting"
+                    elif is_lock:
+                        risk = "safe"
+                        rationale = f"Python venv — {os.path.basename(dep_file)} present, restorable exactly"
                 candidates.append(
                     Recommendation(
                         path=path,
