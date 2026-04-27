@@ -171,6 +171,7 @@ from file_actions import (
     remove_path_from_scan,
     update_path_size_in_scan,
 )
+import cleanup_tools
 
 CleanupRule = namedtuple(
     "CleanupRule",
@@ -182,8 +183,11 @@ CleanupRule = namedtuple(
         "action",
         "rationale",
         "regeneration",
+        "tool",
     ],
 )
+CleanupRule.__new__.__defaults__ = (None,)  # tool is optional
+
 Recommendation = namedtuple(
     "Recommendation",
     [
@@ -196,8 +200,10 @@ Recommendation = namedtuple(
         "action",
         "rationale",
         "regeneration",
+        "tool",
     ],
 )
+Recommendation.__new__.__defaults__ = (None,)
 
 TIER_ORDER = {
     "purge_now": 0,
@@ -257,6 +263,7 @@ CLEANUP_RULES = [
         "review",
         "Message attachments are real user content, not a cache",
         "Delete individual attachments in Messages or archive them elsewhere",
+        "imessage_backup",
     ),
     CleanupRule(
         "*/Library/Application Support/*/User Data",
@@ -539,9 +546,10 @@ CLEANUP_RULES = [
         "dev_tools",
         "rebuildable_dev",
         "low",
-        "delete",
+        "review",
         "iOS Simulator runtimes and device data",
         "Re-download runtimes from Xcode settings when needed",
+        "sim_cleanup",
     ),
     CleanupRule(
         "*/node_modules",
@@ -611,8 +619,82 @@ CLEANUP_RULES = [
 
 # ── Matching Engine ──────────────────────────────────────────────────────────
 
+_SEEN_PATHS_CACHE = {}  # scan_dir -> (root_mtime, dict)
+_SEEN_PATHS_SIDECAR = ".seen_paths_cache.json"
+
+
+def invalidate_seen_paths(scan_dir=None):
+    """Drop the cached seen-paths map for ``scan_dir`` (or all if None).
+
+    Also removes the on-disk sidecar so the next launch re-reads the
+    snapshot fresh.
+    """
+    if scan_dir is None:
+        targets = list(_SEEN_PATHS_CACHE.keys())
+        _SEEN_PATHS_CACHE.clear()
+    else:
+        _SEEN_PATHS_CACHE.pop(scan_dir, None)
+        targets = [scan_dir]
+    for sd in targets:
+        sidecar = os.path.join(sd, _SEEN_PATHS_SIDECAR)
+        try:
+            os.remove(sidecar)
+        except OSError:
+            pass
+
+
+def _seen_paths_sidecar(scan_dir):
+    return os.path.join(scan_dir, _SEEN_PATHS_SIDECAR)
+
+
+def _try_read_sidecar(scan_dir):
+    """Return seen_paths dict if a fresh sidecar exists, else None."""
+    path = _seen_paths_sidecar(scan_dir)
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        return None
+    # Sidecar entries are [size_bytes, size_str]; convert back to tuples.
+    return {p: (int(v[0]), v[1]) for p, v in entries.items() if isinstance(v, list) and len(v) == 2}
+
+
+def _write_sidecar(scan_dir, seen_paths):
+    path = _seen_paths_sidecar(scan_dir)
+    payload = {
+        "version": 1,
+        "entries": {p: [size_bytes, size_str] for p, (size_bytes, size_str) in seen_paths.items()},
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f)
+    except OSError:
+        pass  # cache is best-effort
+
+
 def _load_seen_paths(scan_dir):
-    """Collect unique paths with their parsed size from a scan directory."""
+    """Collect unique paths with their parsed size from a scan directory.
+
+    Memoized in-memory per scan_dir AND on-disk via a JSON sidecar
+    (`.seen_paths_cache.json` inside the scan dir). The sidecar is
+    deleted by `invalidate_seen_paths` whenever the snapshot mutates.
+    Walking the mirrored tree fresh is multi-second on real machines
+    (47k+ disk_usage.txt files); reading the sidecar is sub-100ms.
+    """
+    cached = _SEEN_PATHS_CACHE.get(scan_dir)
+    if cached:
+        return cached[1]
+
+    sidecar = _try_read_sidecar(scan_dir)
+    if sidecar is not None:
+        _SEEN_PATHS_CACHE[scan_dir] = (None, sidecar)
+        return sidecar
+
     seen_paths = {}
     for dirpath, _dirnames, filenames in os.walk(scan_dir):
         if "disk_usage.txt" not in filenames:
@@ -631,6 +713,8 @@ def _load_seen_paths(scan_dir):
                     continue
                 if path not in seen_paths or size_bytes > seen_paths[path][0]:
                     seen_paths[path] = (size_bytes, size_str)
+    _SEEN_PATHS_CACHE[scan_dir] = (None, seen_paths)
+    _write_sidecar(scan_dir, seen_paths)
     return seen_paths
 
 
@@ -701,6 +785,11 @@ def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
                     elif is_lock:
                         risk = "safe"
                         rationale = f"Python venv — {os.path.basename(dep_file)} present, restorable exactly"
+                tool_name = rule.tool
+                if tool_name:
+                    recipe = cleanup_tools.get(tool_name)
+                    if not (recipe and recipe.applies_to(path)):
+                        tool_name = None  # rule says tool, but this path doesn't qualify
                 candidates.append(
                     Recommendation(
                         path=path,
@@ -712,6 +801,7 @@ def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
                         action=rule.action,
                         rationale=rationale,
                         regeneration=regeneration,
+                        tool=tool_name,
                     )
                 )
                 break
@@ -867,17 +957,30 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             pass
 
         visible_area = max(1, height - 5)
-        lines_per_item = 3
-        max_visible_items = max(1, visible_area // lines_per_item)
+        # Per-row heights: tool-bearing rows get an extra line for the
+        # CTA. Rendered as primary + path + (CTA?) + blank gap.
+        heights = []
+        for r in rows:
+            heights.append(4 if r["rec"].tool else 3)
+
+        # Page size for PgUp/PgDn — approximate average so it still
+        # advances by a screenful on tool-heavy ladders.
+        avg_h = max(1, sum(heights) // max(1, len(heights)))
+        max_visible_items = max(1, visible_area // avg_h)
+
+        # Choose scroll_offset so that the selected row fits in the
+        # visible area. Bump forward until cumulative height from
+        # scroll_offset through selected (inclusive) fits.
         scroll_offset = 0
-        if selected >= max_visible_items:
-            scroll_offset = selected - max_visible_items + 1
+        while scroll_offset < selected and sum(heights[scroll_offset:selected + 1]) > visible_area:
+            scroll_offset += 1
 
         y = 2
 
-        for idx in range(scroll_offset, min(len(rows), scroll_offset + max_visible_items)):
+        for idx in range(scroll_offset, len(rows)):
             row = rows[idx]
-            if y + 1 >= height - 2:
+            row_height = heights[idx]
+            if y + row_height - 1 >= height - 2:
                 break
 
             rec = row["rec"]
@@ -886,9 +989,20 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             color = curses.color_pair(risk_color.get(rec.risk, 21))
 
             display_path = _shorten_path(rec.path)
+            tool_recipe = cleanup_tools.get(rec.tool) if rec.tool else None
+            rationale = rec.rationale
+            if tool_recipe:
+                # First render kicks off a background probe; subsequent
+                # renders pick up the live summary once it's ready.
+                live = cleanup_tools.cached_summary(tool_recipe, rec.path)
+                if live:
+                    rationale = live
             primary = "{action}: {rationale}".format(
                 action=ACTION_LABELS.get(rec.action, rec.action),
-                rationale=rec.rationale,
+                rationale=rationale,
+            )
+            tool_cta = (
+                f"▸ Press T to open {tool_recipe.label}" if tool_recipe else None
             )
             num_col = "{num:>2}.".format(num=idx + 1)
             size_col = "{size:>6}".format(size=rec.size_human)
@@ -926,10 +1040,13 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 if desc_x < width:
                     stdscr.addstr(y, desc_x, primary[: width - desc_x - 1], curses.A_BOLD | attr)
                     stdscr.addstr(y + 1, desc_x, display_path[: width - desc_x - 1], curses.A_DIM | attr)
+                    if tool_cta and y + 2 < height - 2:
+                        cta_attr = curses.color_pair(23) | curses.A_BOLD | attr
+                        stdscr.addstr(y + 2, desc_x, tool_cta[: width - desc_x - 1], cta_attr)
             except curses.error:
                 pass
 
-            y += 3
+            y += row_height
 
         try:
             footer_y = height - 2
@@ -938,7 +1055,19 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             elif view_mode == "active_projects":
                 footer = "  ↑/↓: Nav  p: Unmark project  o: Finder  P: Back to Active  q: Back"
             else:
-                footer = "  ↑/↓: Nav  t: Sort  r: Rescan  a: AI  m: Review  p: Project  V: Reviewed  P: Projects  x: Trash  q: Back"
+                selected_tool = None
+                if rows and 0 <= selected < len(rows):
+                    selected_tool = rows[selected]["rec"].tool
+                tool_hint = ""
+                if selected_tool:
+                    recipe_for_hint = cleanup_tools.get(selected_tool)
+                    if recipe_for_hint:
+                        tool_hint = f"  T: {recipe_for_hint.label}"
+                footer = (
+                    "  ↑/↓: Nav  t: Sort  r: Rescan  a: AI  m: Review  p: Project"
+                    + tool_hint
+                    + "  V: Reviewed  P: Projects  x: Trash  q: Back"
+                )
             stdscr.addstr(footer_y, 0, "─" * min(width - 1, 72))
             stdscr.addstr(
                 footer_y + 1 if footer_y + 1 < height else footer_y,
@@ -1027,6 +1156,34 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             except Exception as exc:
                 _flash_message(stdscr, f"Launch failed: {exc}")
             continue
+        elif key == ord("T"):
+            rec = rows[selected]["rec"]
+            if not rec.tool:
+                _flash_message(stdscr, "No specialized tool for this row.")
+                continue
+            recipe = cleanup_tools.get(rec.tool)
+            if not recipe:
+                _flash_message(stdscr, f"Unknown tool: {rec.tool}")
+                continue
+            helpers = {
+                "load_prefs": _load_preferences,
+                "save_prefs": _save_preferences,
+                "flash": lambda m: _flash_message(stdscr, m),
+            }
+            try:
+                msg = recipe.launch(stdscr, rec.path, helpers)
+            except Exception as exc:
+                msg = f"Tool launch failed: {exc}"
+            if msg:
+                _flash_message(stdscr, msg)
+            # After tool exits, drop the cached summary for this row and
+            # rebuild so any size / state change is reflected.
+            cleanup_tools.invalidate_summary(rec.path)
+            if scan_dir:
+                recommendations, ordered_recommendations, rows = rebuild_rows(sort_mode, view_mode)
+                if rows:
+                    selected = min(selected, len(rows) - 1)
+            continue
         elif key == ord("t"):
             selected_path = rows[selected]["rec"].path
             sort_mode = SORT_SIZE if sort_mode == SORT_LADDER else SORT_LADDER
@@ -1041,6 +1198,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             if not scan_dir or not root_path:
                 _flash_message(stdscr, "Cannot rescan: scan context unavailable.")
                 continue
+            cleanup_tools.invalidate_summary(rec.path)
             try:
                 if not os.path.exists(rec.path):
                     remove_path_from_scan(scan_dir, root_path, rec.path)
@@ -1049,6 +1207,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                     new_size = measure_path_size_bytes(rec.path)
                     update_path_size_in_scan(scan_dir, root_path, rec.path, new_size)
                     msg = f"Rescanned: {_format_bytes(new_size)}"
+                invalidate_seen_paths(scan_dir)
                 recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
                 ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
                 rows = _build_rows(ordered_recommendations)
@@ -1107,6 +1266,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 if scan_dir and root_path:
                     try:
                         remove_path_from_scan(scan_dir, root_path, rec.path)
+                        invalidate_seen_paths(scan_dir)
                         recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
                         ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
                         rows = _build_rows(ordered_recommendations)
@@ -1128,6 +1288,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 move_path_to_trash(rec.path)
                 if scan_dir and root_path:
                     remove_path_from_scan(scan_dir, root_path, rec.path)
+                    invalidate_seen_paths(scan_dir)
                     recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
                     ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
                     rows = _build_rows(ordered_recommendations)

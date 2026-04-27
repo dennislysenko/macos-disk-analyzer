@@ -65,6 +65,7 @@ All bindings are case-sensitive.
 | `m`   | Mark this row reviewed (per-scan; filters it out of Active view).      |
 | `p`   | Mark as an active project (global). For `node_modules` and `venv`/`.venv`/`env`/`.env` rows, walks up to the parent project dir; other paths are marked as-is. |
 | `a`   | AI-analyze. Venv rows only. Prompts for agent (Claude / Codex) on first use, optionally remembers the choice, then launches a new Terminal.app window `cd`'d into the venv's parent with a hardcoded prompt asking the agent to sync `requirements.txt` and write a `.python-version`. Non-venv rows flash "AI-analyze only supports Python venvs right now." |
+| `T`   | Open the row's specialized cleaner (see §3.4). Active only on rows whose rule declares a `tool`; flashes "No specialized tool for this row." otherwise. Footer dynamically advertises the tool name when one is available for the selected row. After the tool exits, the ladder rebuilds so updated sizes / disappeared rows are reflected. |
 
 #### Per-row actions (Reviewed view)
 
@@ -179,10 +180,99 @@ from; if it drifts from reality the user sees stale sizes.
 ### 3.3 Agent launcher (`_launch_ai_agent_for_venv`)
 
 Opens Terminal.app via `osascript` with `cd <parent> && <agent> '<prompt>'`.
-The prompt (`VENV_AI_PROMPT`) is hardcoded for venv sync; we'll
-generalize when a second use case lands. The agent choice lives in
-`preferences.json` under `ai_agent` (`claude` or `codex`); absence
-means "ask every time".
+The prompt (`VENV_AI_PROMPT`) is hardcoded for venv sync. The agent choice
+lives in `preferences.json` under `ai_agent` (`claude` or `codex`); absence
+means "ask every time". Conceptually this is a `kind="agent"` recipe; it
+predates the registry in §3.4 and has not been folded in yet.
+
+### 3.4 Specialized cleaner registry (`cleanup_tools.py`)
+
+A small registry of "situation-specific" recipes that the ladder hands off
+to when a row matches a known cleanup situation. Two kinds today:
+
+- `kind="tui"` — launch an external interactive tool in a new Terminal
+  window. Example: `sim_cleanup`. Resolution order:
+  (1) `preferences.json → tools.sim_cleanup.path`,
+  (2) managed install at `~/.local/share/disk-analyzer/tools/sim_cleanup.py`,
+  (3) dev clone at `~/dev/ios-simulator-cleanup/sim_cleanup.py`,
+  (4) `which sim_cleanup` / `which sim_cleanup.py`.
+  When none resolve, the recipe shows an install runbook before
+  launching (see "self-installing recipes" below).
+- `kind="runbook"` — walk the user through a multi-step procedure in a
+  curses panel. Example: `imessage_backup` (install
+  `imessage-exporter`, grant Full Disk Access, run the export, enable
+  Messages in iCloud, return to the ladder to trash the local copy).
+
+Recipes carry two optional setup fields that turn a TUI recipe into a
+self-installing one:
+
+- `installed_check()` — returns a non-empty string when the tool is
+  ready to run, else `None`. Used both by the install runbook's per-
+  step `check` (so the ✓ flips when the install lands) and by the
+  recipe's own `launch` to gate execution.
+- `install_steps` — same shape as runbook steps. Rendered via
+  `_show_runbook` whenever `launch` discovers the tool is missing.
+  After the user closes the install panel, `launch` re-resolves the
+  binary and either proceeds or flashes "tool not installed — aborted."
+
+For sim_cleanup the install step downloads the upstream raw URL
+(`https://raw.githubusercontent.com/dennislysenko/ios-simulator-cleanup/main/sim_cleanup.py`)
+into the managed location and `chmod +x`'s it. No vendoring; upstream
+is a single-file MIT-licensed script.
+
+Wiring path:
+
+1. A `CleanupRule` declares `tool="<recipe_name>"` (last positional arg,
+   defaults to `None`). Example rules: `*/Library/Developer/CoreSimulator`
+   → `sim_cleanup`; `*/Library/Messages/Attachments` →
+   `imessage_backup`.
+2. `generate_recommendations` looks the recipe up in `cleanup_tools`
+   and confirms `recipe.applies_to(path)` is true (extra gate beyond
+   the pattern). The live summary is **not** computed here — that
+   would block initial paint on slow probes (sim_cleanup walks the
+   CoreSimulator tree and takes several seconds). Instead, the static
+   rule rationale is used.
+3. Render time, for tool-bearing rows, the renderer calls
+   `cleanup_tools.cached_summary(recipe, path)`. The first call kicks
+   off a daemon thread to compute `recipe.summary(path)` and returns
+   `None` immediately; subsequent calls return the cached result.
+   When the worker finishes, the next render (any keystroke triggers
+   one) swaps the static rationale for the live one (e.g. "5
+   simulators, 24 GB total — handoff to sim_cleanup"). Failures are
+   swallowed; the static rationale stays. `r` rescan and `T` launch
+   both invalidate the row's cache entry so the next render re-probes.
+4. The recipe name is threaded through `Recommendation.tool`. Tool-
+   bearing rows keep the standard `Action: rationale` primary line and
+   add a third line `▸ Press T to open <recipe.label>` in cyan/bold
+   (the line that's normally a blank gap between rows). Rows without a
+   tool keep the blank gap. The footer also advertises
+   `T: <recipe.label>` for the selected row.
+5. On `T`, `show_recommendations` calls
+   `recipe.launch(stdscr, path, helpers)`. The `helpers` dict gives the
+   recipe `load_prefs`, `save_prefs`, and `flash` so it can prompt for /
+   persist tool paths and surface status without owning curses
+   primitives. Return value is a flash message (or `None`).
+6. After `launch` returns, the ladder is rebuilt unconditionally so
+   sizes settle from any underlying mutation.
+
+Runbook UI (`cleanup_tools._show_runbook`): one step on screen at a
+time. Each step has `title`, `body`, optional `command`, optional
+`open_url` / `open_path`, optional `check`. The `check` callable is
+invoked at render time and, when it returns a truthy string, the step
+renders with a green `✓ already done` banner and dims the title (the
+body still shows so the user can re-run if they want). General pattern:
+recipes use `check` to detect already-satisfied preconditions
+(`shutil.which("imessage-exporter")`, "export folder exists", etc.) so
+the runbook is honest about what's left to do.
+
+Keys: `n`/`→` next, `b`/`←` back, `c` copies the current command to the
+clipboard via `pbcopy`, `r` runs the command in a new Terminal window,
+`o` opens the URL/path, `q`/`Esc` returns to the ladder.
+
+Adding a new recipe is a four-step exercise: write `applies_to` /
+`summary` / `launch`, call `cleanup_tools.register(...)` at import time,
+add a `tool="..."` to the matching `CleanupRule`, and document the
+flow in `E2E_FLOWS.md`.
 
 ---
 

@@ -725,6 +725,14 @@ def run_latest_recommendations(stdscr, config):
     browser.root_path = root_path
 
     scan_dir = os.path.join(output_dir, latest_dir)
+    stdscr.clear()
+    try:
+        stdscr.addstr(1, 2, "Loading recommendations...", curses.A_BOLD)
+        stdscr.addstr(2, 2, "(first open of a new scan reads the full snapshot;", curses.A_DIM)
+        stdscr.addstr(3, 2, " subsequent opens are instant.)", curses.A_DIM)
+    except curses.error:
+        pass
+    stdscr.refresh()
     recommendations = generate_recommendations(scan_dir, root_path)
     show_recommendations(stdscr, recommendations, scan_dir=scan_dir, root_path=root_path)
 
