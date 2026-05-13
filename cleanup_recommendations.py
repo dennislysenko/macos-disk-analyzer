@@ -8,7 +8,9 @@ import curses
 import fnmatch
 import json
 import os
+import queue
 import subprocess
+import threading
 from collections import namedtuple
 
 REVIEWED_FILE = "reviewed_paths.json"
@@ -926,6 +928,34 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
     rows = _build_rows(ordered_recommendations)
     selected = 0
 
+    # Background trash worker: serialize trashes so concurrent disk_usage.txt
+    # rewrites can't race. The main loop drains `trash_results` each tick.
+    trash_in_flight = {}  # path -> True
+    trash_failed = {}     # path -> error message (sticky until next keypress)
+    trash_queue = queue.Queue()
+    trash_results = queue.Queue()
+    worker_started = [False]
+
+    def _trash_worker():
+        while True:
+            path = trash_queue.get()
+            if path is None:
+                return
+            try:
+                move_path_to_trash(path)
+                if scan_dir and root_path:
+                    remove_path_from_scan(scan_dir, root_path, path)
+                    invalidate_seen_paths(scan_dir)
+                trash_results.put((path, True, None))
+            except Exception as exc:
+                trash_results.put((path, False, str(exc)))
+
+    def _ensure_worker():
+        if not worker_started[0]:
+            t = threading.Thread(target=_trash_worker, daemon=True)
+            t.start()
+            worker_started[0] = True
+
     def rebuild_rows(current_sort, current_view):
         if current_view == "active_projects":
             synth = _build_active_project_recommendations(_load_active_projects(), scan_dir)
@@ -936,6 +966,26 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
         return recs, ordered, _build_rows(ordered)
 
     while True:
+        # Drain completed background trashes before redraw.
+        drained_any = False
+        while True:
+            try:
+                done_path, ok, msg = trash_results.get_nowait()
+            except queue.Empty:
+                break
+            drained_any = True
+            trash_in_flight.pop(done_path, None)
+            if ok:
+                recommendations = [r for r in recommendations if r.path != done_path]
+                ordered_recommendations = [r for r in ordered_recommendations if r.path != done_path]
+                rows = [r for r in rows if r["rec"].path != done_path]
+                if rows:
+                    selected = min(selected, len(rows) - 1)
+                else:
+                    selected = 0
+            else:
+                trash_failed[done_path] = msg or "unknown error"
+
         stdscr.clear()
         height, width = stdscr.getmaxyx()
 
@@ -1001,6 +1051,12 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 action=ACTION_LABELS.get(rec.action, rec.action),
                 rationale=rationale,
             )
+            in_flight = rec.path in trash_in_flight
+            failed_msg = trash_failed.get(rec.path)
+            if in_flight:
+                primary = "Trashing… (will disappear when done)"
+            elif failed_msg:
+                primary = f"Trash failed: {failed_msg}"
             tool_cta = (
                 f"▸ Press T to open {tool_recipe.label}" if tool_recipe else None
             )
@@ -1079,8 +1135,20 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             pass
 
         stdscr.refresh()
-        stdscr.nodelay(False)
+        if trash_in_flight:
+            stdscr.timeout(300)
+        else:
+            stdscr.timeout(-1)
         key = stdscr.getch()
+        stdscr.timeout(-1)
+
+        if key == -1:
+            # Timeout tick — loop to drain results and redraw.
+            continue
+
+        # Any real keypress clears the sticky "Trash failed" badges.
+        if trash_failed:
+            trash_failed.clear()
 
         if key == ord("q") or key == 27:
             break
@@ -1262,14 +1330,17 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             continue
         elif key == ord("x"):
             rec = rows[selected]["rec"]
+            if rec.path in trash_in_flight:
+                _flash_message(stdscr, "Already trashing this one…")
+                continue
             if not os.path.exists(rec.path):
                 if scan_dir and root_path:
                     try:
                         remove_path_from_scan(scan_dir, root_path, rec.path)
                         invalidate_seen_paths(scan_dir)
-                        recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
-                        ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
-                        rows = _build_rows(ordered_recommendations)
+                        recommendations = [r for r in recommendations if r.path != rec.path]
+                        ordered_recommendations = [r for r in ordered_recommendations if r.path != rec.path]
+                        rows = [r for r in rows if r["rec"].path != rec.path]
                         if rows:
                             selected = min(selected, len(rows) - 1)
                         _flash_message(stdscr, "Path already gone — removed from list.")
@@ -1284,18 +1355,13 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             confirm = _prompt_confirmation(stdscr, prompt)
             if confirm != ord("y"):
                 continue
-            try:
-                move_path_to_trash(rec.path)
-                if scan_dir and root_path:
-                    remove_path_from_scan(scan_dir, root_path, rec.path)
-                    invalidate_seen_paths(scan_dir)
-                    recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
-                    ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
-                    rows = _build_rows(ordered_recommendations)
-                    if rows:
-                        selected = min(selected, len(rows) - 1)
-                _flash_message(stdscr, "Moved to Trash.")
-            except Exception as exc:
-                _flash_message(stdscr, f"Trash failed: {exc}")
+            # Queue the trash in the background and advance selection so the
+            # user can immediately confirm the next one.
+            trash_failed.pop(rec.path, None)
+            trash_in_flight[rec.path] = True
+            _ensure_worker()
+            trash_queue.put(rec.path)
+            if selected < len(rows) - 1:
+                selected += 1
         elif key == curses.KEY_RESIZE:
             pass
