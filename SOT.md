@@ -102,6 +102,48 @@ what's next to them in the filesystem:
 Lock vs manifest split lives in `VENV_LOCKFILES` / `VENV_MANIFESTS`
 constants and `_venv_dependency_file`.
 
+### 1.4a Unknown big chunks
+
+After the rule-matching pass, `generate_recommendations` does a second
+sweep over `_load_seen_paths` for directories ≥ `UNKNOWN_MIN_BYTES`
+(1 GB) that no rule matched. These surface as rows with
+`risk="unknown"`, `tier="unknown_chunk"`, action `review`, and
+rationale "Unclassified large directory — no matching rule" (magenta in
+the ladder).
+
+Filtering:
+- Drops the scan root itself.
+- Drops paths inside `UNKNOWN_EXCLUDED_PREFIXES` (`/private`, `/opt`,
+  `/var`, `/System`, `/usr`, `/Library` (system), `/bin`, `/sbin`,
+  `/cores`, `/Volumes`) — macOS / OS-managed territory.
+- Drops paths *inside* a macOS file-package bundle (any ancestor
+  ending in `PACKAGE_EXTENSIONS`: `.app`, `.photoslibrary`, `.logicx`,
+  `.framework`, etc.). The bundle path itself is still eligible; its
+  internals are not. So `Photos Library.photoslibrary` surfaces as one
+  24 GB row instead of four fragmented database/derivatives rows.
+- Drops anything overlapping a rule-matched accepted path in *either
+  direction*, so sizes don't double-count.
+- Respects active-projects and reviewed filters identically to the
+  rule-matched pass.
+
+**Dedup is leaf-wins** for unknowns (opposite of the parent-wins
+behavior used for rule-matched buckets). Rationale: a rule-matched
+parent like `~/Library/Caches` is a single semantic unit you act on
+once, whereas an unknown parent is just a sum of unrelated children —
+so the natural rule for unknowns is "show the deepest qualifying
+chunk." Implementation: sort by path length descending, accept iff no
+already-accepted path is a strict descendant. So if both
+`/Applications` and `/Applications/Xcode.app` qualify, only Xcode.app
+keeps its row.
+
+`RISK_ORDER["unknown"] = 4` (above `high`), so in ladder sort
+(`safest/largest first`) unknowns sink to the bottom — exhaust the
+vouched-for opportunities first, then triage the mystery pile. In size
+sort they interleave with known rows by raw `-size_bytes`, which is the
+primary use case: see every big bite regardless of classification.
+Unknown rows are actionable via the standard `x` / `m` / `p` / `o`
+keys; `a` AI-analyze and `T` tool keys are no-ops (no tool wired).
+
 ### 1.5 Active projects
 
 Global (not per-scan) allowlist of project roots that should never

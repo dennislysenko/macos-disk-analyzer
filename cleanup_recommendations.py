@@ -212,6 +212,7 @@ TIER_ORDER = {
     "rebuildable_dev": 1,
     "reviewable_state": 2,
     "human_data": 3,
+    "unknown_chunk": 4,
 }
 
 RISK_ORDER = {
@@ -219,6 +220,7 @@ RISK_ORDER = {
     "low": 1,
     "medium": 2,
     "high": 3,
+    "unknown": 4,
 }
 
 TIER_LABELS = {
@@ -226,6 +228,7 @@ TIER_LABELS = {
     "rebuildable_dev": "Rebuildable Dev",
     "reviewable_state": "Review First",
     "human_data": "Human Data",
+    "unknown_chunk": "Unknown",
 }
 
 ACTION_LABELS = {
@@ -241,10 +244,70 @@ RISK_LABELS = {
     "low": "[low risk]",
     "medium": "[medium risk]",
     "high": "[high risk]",
+    "unknown": "[unknown]",
 }
 
 MAX_RECOMMENDATIONS = 100
 MIN_RECOMMENDATION_BYTES = 100 * 1024 * 1024
+UNKNOWN_MIN_BYTES = 1024 * 1024 * 1024  # 1 GB floor for unclassified chunks
+
+# System roots that aren't actionable as unknown chunks — macOS / OS-managed
+# territory. These get filtered out before unknowns are emitted, not marked
+# high-risk, because there's nothing useful for the user to do with them.
+UNKNOWN_EXCLUDED_PREFIXES = (
+    "/private",
+    "/opt",
+    "/var",
+    "/System",
+    "/usr",
+    "/Library",   # system /Library; user's lives at /Users/<name>/Library
+    "/bin",
+    "/sbin",
+    "/cores",
+    "/Volumes",
+)
+
+
+def _is_excluded_system_path(norm_path):
+    for prefix in UNKNOWN_EXCLUDED_PREFIXES:
+        if norm_path == prefix or norm_path.startswith(prefix + "/"):
+            return True
+    return False
+
+
+# macOS "file packages" — directories that Finder presents as single
+# files. Descending past these boundaries fragments a logical unit, so
+# unknown-chunk emission stops at the bundle path.
+PACKAGE_EXTENSIONS = (
+    ".app",
+    ".photoslibrary",
+    ".aplibrary",
+    ".logicx",
+    ".band",
+    ".bundle",
+    ".framework",
+    ".xcodeproj",
+    ".xcworkspace",
+    ".playground",
+    ".docset",
+    ".pages",
+    ".numbers",
+    ".key",
+    ".rtfd",
+)
+
+
+def _is_inside_package_bundle(norm_path):
+    """True iff a strict ancestor of norm_path is a macOS package bundle.
+
+    Equality with the bundle path returns False — the bundle itself is fine.
+    """
+    parts = norm_path.split(os.sep)
+    for part in parts[:-1]:
+        for ext in PACKAGE_EXTENSIONS:
+            if part.endswith(ext):
+                return True
+    return False
 SORT_LADDER = "ladder"
 SORT_SIZE = "size"
 SORT_LABELS = {
@@ -754,7 +817,7 @@ def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
         List of Recommendation namedtuples sorted from lowest-hanging fruit
         upward.
     """
-    del root_path  # kept for backwards compatibility with existing callers
+    root_norm = os.path.normpath(root_path) if root_path else None
 
     seen_paths = _load_seen_paths(scan_dir)
     reviewed = _load_reviewed_paths(scan_dir)
@@ -824,6 +887,64 @@ def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
     for candidate in candidates:
         if not any(candidate.path.startswith(existing.path + "/") for existing in accepted):
             accepted.append(candidate)
+
+    # Unknown-chunk pass: surface big directories that no rule matched, so
+    # the user can manually triage them. Skip anything that overlaps a
+    # rule-matched accepted path (either direction) to avoid double-counting.
+    matched_paths = {os.path.normpath(r.path) for r in accepted}
+    unknowns = []
+    for path, (size_bytes, _size_str) in seen_paths.items():
+        if size_bytes < UNKNOWN_MIN_BYTES:
+            continue
+        if _is_under_active_project(path, active_projects):
+            continue
+        if only_reviewed:
+            if path not in reviewed:
+                continue
+        elif path in reviewed:
+            continue
+        norm = os.path.normpath(path)
+        if root_norm and norm == root_norm:
+            continue  # scan root itself is not actionable
+        if _is_excluded_system_path(norm):
+            continue  # macOS / OS-managed territory, not user-actionable
+        if _is_inside_package_bundle(norm):
+            continue  # bundle internals — the bundle itself is the unit
+        if norm in matched_paths:
+            continue
+        if any(
+            norm.startswith(mp + os.sep) or mp.startswith(norm + os.sep)
+            for mp in matched_paths
+        ):
+            continue
+        unknowns.append((path, size_bytes))
+
+    # Dedup unknowns: leaf-wins. Unlike rule-matched buckets (where the
+    # parent IS the semantic unit), an unknown parent is just a sum of
+    # unrelated children — show the deepest qualifying chunks. Sort by
+    # path length descending so children are seen before their parents.
+    unknowns.sort(key=lambda x: len(x[0]), reverse=True)
+    accepted_unknowns = []
+    for path, size_bytes in unknowns:
+        if any(p.startswith(path + "/") for p, _ in accepted_unknowns):
+            continue  # this is an ancestor of an already-accepted leaf — drop it
+        accepted_unknowns.append((path, size_bytes))
+
+    for path, size_bytes in accepted_unknowns:
+        accepted.append(
+            Recommendation(
+                path=path,
+                size_bytes=size_bytes,
+                size_human=_format_bytes(size_bytes),
+                category="unknown",
+                tier="unknown_chunk",
+                risk="unknown",
+                action="review",
+                rationale="Unclassified large directory — no matching rule",
+                regeneration="Inspect contents before deleting",
+                tool=None,
+            )
+        )
 
     accepted.sort(key=_sort_key)
     return accepted[:MAX_RECOMMENDATIONS]
@@ -912,11 +1033,13 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
     curses.init_pair(22, curses.COLOR_RED, -1)     # medium/high
     curses.init_pair(23, curses.COLOR_CYAN, -1)    # header
     curses.init_pair(24, curses.COLOR_WHITE, curses.COLOR_BLUE)  # selected
+    curses.init_pair(25, curses.COLOR_MAGENTA, -1)  # unknown
     risk_color = {
         "safe": 20,
         "low": 21,
         "medium": 22,
         "high": 22,
+        "unknown": 25,
     }
 
     has_any_reviewed = bool(_load_reviewed_paths(scan_dir)) if scan_dir else False
