@@ -304,6 +304,14 @@ def analyze_single_directory(directory, output_base, base_directory, min_size_gb
             with _print_lock:
                 print(f"Skipping excluded directory: {directory}")
         return []
+    if os.path.islink(directory):
+        log.info(f"Skipping symlink: {directory} -> {os.readlink(directory)}")
+        if _stats:
+            _stats.record_skip()
+        if not quiet:
+            with _print_lock:
+                print(f"Skipping symlinked directory: {directory} -> {os.readlink(directory)}")
+        return []
 
     with _print_lock:
         print(f"Analyzing: {directory}")
@@ -364,7 +372,7 @@ def analyze_single_directory(directory, output_base, base_directory, min_size_gb
 
         try:
             size_bytes = parse_size(size_str)
-            if size_bytes >= min_size_bytes and os.path.isdir(path):
+            if size_bytes >= min_size_bytes and os.path.isdir(path) and not os.path.islink(path):
                 large_subdirs.append(path)
                 with _print_lock:
                     print(f"  Queuing large subdirectory: {path} ({size_str})")
@@ -394,6 +402,7 @@ def run_analysis(directory, output_base, base_directory, min_size_gb=2,
             os.path.join(directory, name)
             for name in os.listdir(directory)
             if os.path.isdir(os.path.join(directory, name))
+               and not os.path.islink(os.path.join(directory, name))
                and not is_excluded_path(os.path.join(directory, name))
         ])
     except OSError as e:
@@ -453,7 +462,7 @@ def run_analysis(directory, output_base, base_directory, min_size_gb=2,
                 try:
                     for name in os.listdir(d):
                         child = os.path.join(d, name)
-                        if os.path.isdir(child) and not is_excluded_path(child):
+                        if os.path.isdir(child) and not os.path.islink(child) and not is_excluded_path(child):
                             submit_dir(child, depth + 1, lookahead_remaining - 1)
                 except OSError:
                     pass
