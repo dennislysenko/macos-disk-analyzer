@@ -61,7 +61,7 @@ All bindings are case-sensitive.
 |-------|------------------------------------------------------------------------|
 | `x`   | Move to Trash. Confirms y/n. On success prunes the row from the scan snapshot. If the path is already gone, prunes the stale snapshot entry instead of just erroring. |
 | `o`   | Open the path in Finder.                                               |
-| `r`   | Rescan this row. If the path is gone → prune from snapshot. If present → re-measure with `du -sk` and propagate updated sizes up the scan tree. |
+| `r`   | Rescan this row asynchronously (background mutation worker; UI stays responsive). If the path is gone → prune from snapshot. If present → re-measure with `du -sk` and propagate updated sizes up the scan tree. While in flight the row's primary line reads `Rescanning…`; on completion the ladder rebuilds. Pressing `r` again on an already in-flight row flashes "Mutation already in flight for this row." |
 | `m`   | Mark this row reviewed (per-scan; filters it out of Active view).      |
 | `p`   | Mark as an active project (global). For `node_modules` and `venv`/`.venv`/`env`/`.env` rows, walks up to the parent project dir; other paths are marked as-is. |
 | `a`   | AI-analyze. Venv rows only. Prompts for agent (Claude / Codex) on first use, optionally remembers the choice, then launches a new Terminal.app window `cd`'d into the venv's parent with a hardcoded prompt asking the agent to sync `requirements.txt` and write a `.python-version`. Non-venv rows flash "AI-analyze only supports Python venvs right now." |
@@ -230,6 +230,17 @@ from; if it drifts from reality the user sees stale sizes.
 3. `_sort_recommendations` re-sorts for the UI toggle (`SORT_LADDER` vs `SORT_SIZE`).
 4. `_build_rows` wraps Recommendations for the curses renderer. `_build_active_project_recommendations` synthesizes rows for the Active Projects view from the global set (size looked up from the current scan's `_load_seen_paths` if present, else "—").
 5. `show_recommendations` owns the keybind loop. The local `rebuild_rows(sort, view)` closure re-derives `(recommendations, ordered, rows)` from scratch whenever mutation happens, so we never have to reason about partial updates.
+6. Background mutation worker (single daemon thread, lazy-started on
+   first `x` or `r`) serializes both **trash** and **rescan** jobs so
+   the disk_usage.txt rewrites don't race each other. Jobs are tagged
+   tuples `("trash" | "rescan", path)` on `mutation_queue`; results
+   `(kind, path, ok, msg)` on `mutation_results`. The main loop drains
+   results each tick, dispatches by kind, then rebuilds rows once if
+   any rescan completed (sizes may have shifted). While anything is
+   in-flight the loop arms a 300 ms `stdscr.timeout()` so the UI
+   redraws even without keypresses; per-row primary text shows
+   `Trashing…` / `Rescanning…` accordingly. Sticky `trash_failed` /
+   `rescan_failed` badges clear on the next real keypress.
 
 ### 3.3 Agent launcher (`_launch_ai_agent_for_venv`)
 

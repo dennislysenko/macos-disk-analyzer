@@ -1170,31 +1170,50 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
     rows = _build_rows(ordered_recommendations)
     selected = 0
 
-    # Background trash worker: serialize trashes so concurrent disk_usage.txt
-    # rewrites can't race. The main loop drains `trash_results` each tick.
-    trash_in_flight = {}  # path -> True
-    trash_failed = {}     # path -> error message (sticky until next keypress)
-    trash_queue = queue.Queue()
-    trash_results = queue.Queue()
+    # Background mutation worker: serializes trash and rescan operations so
+    # concurrent disk_usage.txt rewrites can't race (both call into
+    # file_actions which rewrites the mirrored snapshot). Jobs are tagged
+    # ("trash" | "rescan", path); results are tagged similarly so the main
+    # loop can dispatch.
+    trash_in_flight = {}   # path -> True
+    trash_failed = {}      # path -> error message (sticky until next keypress)
+    rescan_in_flight = {}  # path -> True
+    rescan_failed = {}     # path -> error message (sticky until next keypress)
+    mutation_queue = queue.Queue()
+    mutation_results = queue.Queue()
     worker_started = [False]
 
-    def _trash_worker():
+    def _mutation_worker():
         while True:
-            path = trash_queue.get()
-            if path is None:
+            job = mutation_queue.get()
+            if job is None:
                 return
+            kind, path = job
             try:
-                move_path_to_trash(path)
-                if scan_dir and root_path:
-                    remove_path_from_scan(scan_dir, root_path, path)
-                    invalidate_seen_paths(scan_dir)
-                trash_results.put((path, True, None))
+                if kind == "trash":
+                    move_path_to_trash(path)
+                    if scan_dir and root_path:
+                        remove_path_from_scan(scan_dir, root_path, path)
+                        invalidate_seen_paths(scan_dir)
+                    mutation_results.put(("trash", path, True, None))
+                elif kind == "rescan":
+                    if not os.path.exists(path):
+                        if scan_dir and root_path:
+                            remove_path_from_scan(scan_dir, root_path, path)
+                            invalidate_seen_paths(scan_dir)
+                        mutation_results.put(("rescan", path, True, "Path gone — removed from scan."))
+                    else:
+                        new_size = measure_path_size_bytes(path)
+                        if scan_dir and root_path:
+                            update_path_size_in_scan(scan_dir, root_path, path, new_size)
+                            invalidate_seen_paths(scan_dir)
+                        mutation_results.put(("rescan", path, True, f"Rescanned: {_format_bytes(new_size)}"))
             except Exception as exc:
-                trash_results.put((path, False, str(exc)))
+                mutation_results.put((kind, path, False, str(exc)))
 
     def _ensure_worker():
         if not worker_started[0]:
-            t = threading.Thread(target=_trash_worker, daemon=True)
+            t = threading.Thread(target=_mutation_worker, daemon=True)
             t.start()
             worker_started[0] = True
 
@@ -1208,25 +1227,50 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
         return recs, ordered, _build_rows(ordered)
 
     while True:
-        # Drain completed background trashes before redraw.
+        # Drain completed background mutations (trash + rescan) before redraw.
         drained_any = False
+        rescan_completed = False
         while True:
             try:
-                done_path, ok, msg = trash_results.get_nowait()
+                kind, done_path, ok, msg = mutation_results.get_nowait()
             except queue.Empty:
                 break
             drained_any = True
-            trash_in_flight.pop(done_path, None)
-            if ok:
-                recommendations = [r for r in recommendations if r.path != done_path]
-                ordered_recommendations = [r for r in ordered_recommendations if r.path != done_path]
-                rows = [r for r in rows if r["rec"].path != done_path]
-                if rows:
-                    selected = min(selected, len(rows) - 1)
+            if kind == "trash":
+                trash_in_flight.pop(done_path, None)
+                if ok:
+                    recommendations = [r for r in recommendations if r.path != done_path]
+                    ordered_recommendations = [r for r in ordered_recommendations if r.path != done_path]
+                    rows = [r for r in rows if r["rec"].path != done_path]
+                    if rows:
+                        selected = min(selected, len(rows) - 1)
+                    else:
+                        selected = 0
                 else:
-                    selected = 0
+                    trash_failed[done_path] = msg or "unknown error"
+            elif kind == "rescan":
+                rescan_in_flight.pop(done_path, None)
+                if ok:
+                    rescan_completed = True
+                else:
+                    rescan_failed[done_path] = msg or "rescan failed"
+
+        # Rescan changed sizes / possibly removed paths — rebuild from snapshot.
+        if rescan_completed:
+            selected_path = rows[selected]["rec"].path if rows and 0 <= selected < len(rows) else None
+            recommendations, ordered_recommendations, rows = rebuild_rows(sort_mode, view_mode)
+            if rows:
+                if selected_path:
+                    for idx, row in enumerate(rows):
+                        if row["rec"].path == selected_path:
+                            selected = idx
+                            break
+                    else:
+                        selected = min(selected, len(rows) - 1)
+                else:
+                    selected = min(selected, len(rows) - 1)
             else:
-                trash_failed[done_path] = msg or "unknown error"
+                selected = 0
 
         stdscr.clear()
         height, width = stdscr.getmaxyx()
@@ -1295,10 +1339,16 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             )
             in_flight = rec.path in trash_in_flight
             failed_msg = trash_failed.get(rec.path)
+            rescanning = rec.path in rescan_in_flight
+            rescan_err = rescan_failed.get(rec.path)
             if in_flight:
                 primary = "Trashing… (will disappear when done)"
             elif failed_msg:
                 primary = f"Trash failed: {failed_msg}"
+            elif rescanning:
+                primary = "Rescanning… (row updates when done)"
+            elif rescan_err:
+                primary = f"Rescan failed: {rescan_err}"
             tool_cta = (
                 f"▸ Press T to open {tool_recipe.label}" if tool_recipe else None
             )
@@ -1377,7 +1427,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             pass
 
         stdscr.refresh()
-        if trash_in_flight:
+        if trash_in_flight or rescan_in_flight:
             stdscr.timeout(300)
         else:
             stdscr.timeout(-1)
@@ -1388,9 +1438,11 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             # Timeout tick — loop to drain results and redraw.
             continue
 
-        # Any real keypress clears the sticky "Trash failed" badges.
+        # Any real keypress clears the sticky failure badges.
         if trash_failed:
             trash_failed.clear()
+        if rescan_failed:
+            rescan_failed.clear()
 
         if key == ord("q") or key == 27:
             break
@@ -1508,24 +1560,14 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             if not scan_dir or not root_path:
                 _flash_message(stdscr, "Cannot rescan: scan context unavailable.")
                 continue
+            if rec.path in rescan_in_flight or rec.path in trash_in_flight:
+                _flash_message(stdscr, "Mutation already in flight for this row.")
+                continue
             cleanup_tools.invalidate_summary(rec.path)
-            try:
-                if not os.path.exists(rec.path):
-                    remove_path_from_scan(scan_dir, root_path, rec.path)
-                    msg = "Path gone — removed from scan."
-                else:
-                    new_size = measure_path_size_bytes(rec.path)
-                    update_path_size_in_scan(scan_dir, root_path, rec.path, new_size)
-                    msg = f"Rescanned: {_format_bytes(new_size)}"
-                invalidate_seen_paths(scan_dir)
-                recommendations = generate_recommendations(scan_dir, root_path, only_reviewed=(view_mode == "reviewed"))
-                ordered_recommendations = _sort_recommendations(recommendations, sort_mode)
-                rows = _build_rows(ordered_recommendations)
-                if rows:
-                    selected = min(selected, len(rows) - 1)
-                _flash_message(stdscr, msg)
-            except Exception as exc:
-                _flash_message(stdscr, f"Rescan failed: {exc}")
+            rescan_failed.pop(rec.path, None)
+            rescan_in_flight[rec.path] = True
+            _ensure_worker()
+            mutation_queue.put(("rescan", rec.path))
             continue
         elif key == ord("p"):
             rec = rows[selected]["rec"]
@@ -1605,7 +1647,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             trash_failed.pop(rec.path, None)
             trash_in_flight[rec.path] = True
             _ensure_worker()
-            trash_queue.put(rec.path)
+            mutation_queue.put(("trash", rec.path))
             if selected < len(rows) - 1:
                 selected += 1
         elif key == curses.KEY_RESIZE:
