@@ -102,6 +102,18 @@ what's next to them in the filesystem:
 Lock vs manifest split lives in `VENV_LOCKFILES` / `VENV_MANIFESTS`
 constants and `_venv_dependency_file`.
 
+Other notable rule shapes:
+- `*/Applications/*.app` — installed app bundles (medium risk,
+  reviewable). `fnmatch`'s `*` matches `/` so both `/Applications/Foo.app`
+  and `/Applications/Foo/Foo.app` are picked up; parent-collapses-children
+  dedup keeps the bundle path as the row, not its internals.
+- `*.photoslibrary` — Photos library bundle, paired with the
+  `photos_cleanup` runbook recipe. Critical that we never `delete` the
+  bundle — the runbook walks the user through in-app management.
+- `*.logicx` — Logic Pro project bundle, high-risk human data.
+- WhatsApp media at `*/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Message/Media`
+  paired with `whatsapp_cleanup` runbook.
+
 ### 1.4a Unknown big chunks
 
 After the rule-matching pass, `generate_recommendations` does a second

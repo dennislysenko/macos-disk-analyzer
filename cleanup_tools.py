@@ -439,6 +439,166 @@ register(ToolRecipe(
 ))
 
 
+# ── photos_cleanup recipe ───────────────────────────────────────────────────
+
+
+def _photos_applies(path):
+    return os.path.normpath(path).endswith(".photoslibrary")
+
+
+def _photos_summary(path):
+    return "Manage in Photos.app: Optimize Storage, empty Recently Deleted, or remove albums — runbook"
+
+
+PHOTOS_STEPS = [
+    {
+        "title": "1. Do NOT trash the .photoslibrary bundle",
+        "body": (
+            "Photos Library is your master photo database. Deleting the bundle "
+            "destroys originals, edits, albums, faces, and memories — including "
+            "anything that wasn't synced to iCloud yet.\n\n"
+            "Reclaim space by managing the library, not by deleting it."
+        ),
+        "command": None,
+    },
+    {
+        "title": "2. Turn on Optimize Mac Storage",
+        "body": (
+            "Photos.app → Settings → General → \"Optimize Mac Storage\". With "
+            "this on, full-resolution originals live in iCloud and Mac keeps "
+            "smaller versions locally; the system evicts originals as disk "
+            "fills. Requires iCloud Photos enabled.\n\n"
+            "First sync can take hours; the .photoslibrary size will shrink "
+            "over time, not instantly."
+        ),
+        "command": "open -a Photos",
+    },
+    {
+        "title": "3. Empty Recently Deleted",
+        "body": (
+            "Photos.app → File menu → Show Recently Deleted → \"Delete All\". "
+            "Items here are still occupying disk for up to 30 days. Emptying "
+            "is the single biggest one-shot win on most libraries."
+        ),
+        "command": "open -a Photos",
+    },
+    {
+        "title": "4. Delete large videos or albums you don't need",
+        "body": (
+            "Sort the library by size (View → Sort → … or use a smart album "
+            "filtered to video). Long screen recordings and 4K clips often "
+            "dominate library size. Delete them, then redo step 3 to actually "
+            "free the bytes."
+        ),
+        "command": "open -a Photos",
+    },
+    {
+        "title": "5. Optional: stop using iCloud Shared Library",
+        "body": (
+            "If the library is a Syndication or Shared Library you no longer "
+            "want, you can stop participating: System Settings → Apple ID → "
+            "iCloud → Photos → Shared Library settings. This removes the "
+            "shared library locally without affecting other participants."
+        ),
+        "command": None,
+        "open_url": "x-apple.systempreferences:com.apple.preference.appleidsettings",
+    },
+    {
+        "title": "6. Return to the ladder",
+        "body": (
+            "Press q to close this panel. The .photoslibrary row will shrink "
+            "on the next scan once iCloud has finished evicting originals."
+        ),
+        "command": None,
+    },
+]
+
+
+def _photos_launch(stdscr, path, helpers):
+    return _show_runbook(stdscr, "Photos library cleanup", PHOTOS_STEPS, path, helpers)
+
+
+register(ToolRecipe(
+    name="photos_cleanup",
+    kind="runbook",
+    label="Photos runbook",
+    applies_to=_photos_applies,
+    summary=_photos_summary,
+    launch=_photos_launch,
+    pref_key=None,
+    default_path=None,
+    installed_check=None,
+    install_steps=None,
+))
+
+
+# ── whatsapp_cleanup recipe ─────────────────────────────────────────────────
+
+
+def _whatsapp_applies(path):
+    norm = os.path.normpath(path)
+    return norm.endswith("/group.net.whatsapp.WhatsApp.shared/Message/Media")
+
+
+def _whatsapp_summary(path):
+    return "Manage in WhatsApp → Settings → Storage and Data → Manage Storage — runbook"
+
+
+WHATSAPP_STEPS = [
+    {
+        "title": "1. Open WhatsApp Storage Management",
+        "body": (
+            "WhatsApp's Manage Storage view sorts chats by disk footprint and "
+            "lets you bulk-select media within a chat. This is the only safe "
+            "way to delete WhatsApp media — trashing the Media directory "
+            "directly can leave the local DB in a broken state.\n\n"
+            "Path: WhatsApp → Settings (⌘,) → Storage and Data → Manage "
+            "Storage."
+        ),
+        "command": "open -a WhatsApp",
+    },
+    {
+        "title": "2. Review by size, delete in bulk",
+        "body": (
+            "Sort chats by size. For each big chat, tap in, switch to the "
+            "media view, select all photos/videos older than a threshold "
+            "(e.g. > 6 months), and delete. Skip pinned/important chats.\n\n"
+            "Tip: \"Larger than 5 MB\" is a useful filter inside a chat — "
+            "screen recordings and forwarded videos dominate."
+        ),
+        "command": None,
+    },
+    {
+        "title": "3. Confirm the Media dir shrank",
+        "body": (
+            "Return to the ladder (press q here) and press r on the WhatsApp "
+            "Media row to re-measure. If the size hasn't dropped, restart "
+            "WhatsApp — it may be holding a write lock on the deleted files "
+            "until the app reconnects."
+        ),
+        "command": None,
+    },
+]
+
+
+def _whatsapp_launch(stdscr, path, helpers):
+    return _show_runbook(stdscr, "WhatsApp media cleanup", WHATSAPP_STEPS, path, helpers)
+
+
+register(ToolRecipe(
+    name="whatsapp_cleanup",
+    kind="runbook",
+    label="WhatsApp runbook",
+    applies_to=_whatsapp_applies,
+    summary=_whatsapp_summary,
+    launch=_whatsapp_launch,
+    pref_key=None,
+    default_path=None,
+    installed_check=None,
+    install_steps=None,
+))
+
+
 # ── Runbook renderer ────────────────────────────────────────────────────────
 
 def _show_runbook(stdscr, title, steps, path, helpers):
