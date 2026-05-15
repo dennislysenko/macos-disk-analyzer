@@ -93,7 +93,7 @@ contains the parent directory between steps 2 and 4.
 
 ---
 
-## 2. Specialized cleaner: `T` key (registry-backed)
+## 2. Specialized cleaner: `t` key (registry-backed)
 
 ### 2.1 Inline call-to-action and footer hint
 
@@ -105,24 +105,24 @@ or `~/Library/Messages/Attachments`.
 2. Navigate to a `CoreSimulator` or `Messages/Attachments` row.
 3. → primary line still reads `Review: <rationale>` (unchanged).
 4. → path line still shows the shortened path.
-5. → a **third** line `▸ Press T to open <label>` is rendered in
+5. → a **third** line `▸ Press t to open <label>` is rendered in
    cyan/bold immediately under the path (using the row's normally-blank
    gap line).
-6. → footer includes `T: sim_cleanup` (or `T: iMessage runbook`).
+6. → footer includes `t: sim_cleanup` (or `t: iMessage runbook`).
 7. Move selection to a row without a tool (e.g. a `node_modules` row).
 8. → no third line — the gap is back.
-9. → `T:` segment is gone from the footer.
+9. → `t:` segment is gone from the footer.
 
 **Pass criteria**: tool-bearing rows are visually distinct enough that a
 user notices the affordance without reading the footer. The CTA is
 additive (does not displace the action label or rationale) and is
 **always-on** for tool-bearing rows.
 
-### 2.2 `T` on a row without a tool flashes
+### 2.2 `t` on a row without a tool flashes
 
 **Steps**:
 1. Select any row whose rationale doesn't mention a runbook/handoff.
-2. ⇥ `T`.
+2. ⇥ `t`.
 3. → flash `No specialized tool for this row.`.
 
 **Pass criteria**: no crash, no state change.
@@ -141,7 +141,7 @@ contain `tools.sim_cleanup.path`, neither
 
 **Steps**:
 1. Select the `CoreSimulator` row.
-2. ⇥ `T`.
+2. ⇥ `t`.
 3. → fullscreen panel `Install sim_cleanup  (1/2)` opens (this is the
    install runbook, not a launch).
 4. → step 1 body explains the managed install location and shows the
@@ -157,21 +157,21 @@ contain `tools.sim_cleanup.path`, neither
 9. → flash `Launched sim_cleanup (~/.local/share/disk-analyzer/tools/sim_cleanup.py).`.
 10. → new Terminal.app window opens running the tool's TUI.
 
-**Pass criteria**: a user with nothing pre-installed can go from `T`
-press to running sim_cleanup in two keystrokes (`T`, `r`, then `q`).
+**Pass criteria**: a user with nothing pre-installed can go from `t`
+press to running sim_cleanup in two keystrokes (`t`, `r`, then `q`).
 The managed binary is left on disk for subsequent runs (flow 3.2).
 
 ### 3.1.5 Aborting the install runbook leaves the row unchanged
 
 **Steps**:
 1. Same preconditions as 3.1.
-2. ⇥ `T` → install runbook opens.
+2. ⇥ `t` → install runbook opens.
 3. ⇥ `q` *without* running the install command.
 4. → flash `sim_cleanup not installed — aborted.`.
-5. → ladder unchanged; row is still tagged with `▸ Press T to open
+5. → ladder unchanged; row is still tagged with `▸ Press t to open
    sim_cleanup`.
 
-**Pass criteria**: aborting is non-destructive. Re-pressing `T` opens
+**Pass criteria**: aborting is non-destructive. Re-pressing `t` opens
 the install runbook again.
 
 ### 3.2 Resolution order for already-installed tool
@@ -184,7 +184,7 @@ the install runbook again.
 - `sim_cleanup` is on `$PATH`.
 
 **Steps**:
-1. ⇥ `T` on the `CoreSimulator` row.
+1. ⇥ `t` on the `CoreSimulator` row.
 2. → no install runbook; flash `Launched sim_cleanup (<resolved path>).`.
 
 **Pass criteria**: resolution prefers the user's explicit pref over
@@ -214,7 +214,7 @@ If `sim_cleanup.py` is missing, the static rationale is shown
 1. Restart the ladder.
 2. → row still renders with the static rationale (live summary failed
    silently).
-3. ⇥ `T` on the row.
+3. ⇥ `t` on the row.
 4. → flash flow re-prompts for a path.
 
 **Pass criteria**: no exception escapes to the curses loop. Recovery is
@@ -223,7 +223,7 @@ self-service.
 ### 3.5 Sizes refresh after sim_cleanup exits
 
 **Steps**:
-1. ⇥ `T` to launch sim_cleanup.
+1. ⇥ `t` to launch sim_cleanup.
 2. In the spawned Terminal, delete a simulator using the tool.
 3. Quit sim_cleanup, return to the ladder window.
 4. ⇥ `r` on the `CoreSimulator` row.
@@ -240,8 +240,8 @@ self-service.
 **Preconditions**: scan included `~/Library/Messages/Attachments`.
 
 **Steps**:
-1. Navigate to the row. → footer includes `T: iMessage runbook`.
-2. ⇥ `T`.
+1. Navigate to the row. → footer includes `t: iMessage runbook`.
+2. ⇥ `t`.
 3. → fullscreen panel: title `iMessage backup → iCloud  (1/6)`.
 4. → step 1 body explains brew install.
 5. → command line shows `brew install imessage-exporter`.
@@ -256,7 +256,7 @@ keybindings.
 (verify with `which imessage-exporter`).
 
 **Steps**:
-1. ⇥ `T` on the Attachments row.
+1. ⇥ `t` on the Attachments row.
 2. → step 1 panel renders with `✓ already done` in the header.
 3. → green `✓ imessage-exporter is on PATH at <path>` banner under the
    step title.
@@ -347,15 +347,18 @@ The "review" warning fires for the Attachments row.
 
 These are easy to break with seemingly unrelated changes.
 
-### 5.1 `t` (lowercase, sort toggle) is unaffected by `T`
+### 5.1 `s` (sort toggle) and `t` (tool) are distinct, both lowercase
 
 **Steps**:
-1. From any view: ⇥ `t`.
+1. From any view: ⇥ `s`.
 2. → header switches `Sort: Ease` ↔ `Sort: Size`.
 3. → selection sticks to the same path across re-sort.
+4. ⇥ `t` on a tool-bearing row.
+5. → recipe launches (or flashes "No specialized tool" if not tool-bearing).
 
-**Pass criteria**: lowercase `t` and uppercase `T` are independent
-keybinds; case sensitivity holds.
+**Pass criteria**: `s` only sorts, `t` only opens the tool. Neither
+requires Shift. No uppercase-letter ladder binds remain for these
+actions.
 
 ### 5.2 Recipes don't run during scan-time matching when the path is missing
 
@@ -378,7 +381,7 @@ When a new recipe is registered in `cleanup_tools.py` and a rule
 declares `tool="<name>"`:
 
 1. Restart `disk-analyzer`.
-2. → footer hint shows `T: <recipe.label>` on matching rows.
+2. → footer hint shows `t: <recipe.label>` on matching rows.
 3. → no other rule, view, or keybinding behavior changed.
 
 **Pass criteria**: registry is the only file that needs editing for a

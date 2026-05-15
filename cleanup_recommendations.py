@@ -1350,7 +1350,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             elif rescan_err:
                 primary = f"Rescan failed: {rescan_err}"
             tool_cta = (
-                f"▸ Press T to open {tool_recipe.label}" if tool_recipe else None
+                f"▸ Press t to open {tool_recipe.label}" if tool_recipe else None
             )
             num_col = "{num:>2}.".format(num=idx + 1)
             size_col = "{size:>6}".format(size=rec.size_human)
@@ -1399,7 +1399,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
         try:
             footer_y = height - 2
             if view_mode == "reviewed":
-                footer = "  ↑/↓: Nav  t: Sort  m: Unreview  p: Active-proj  V: Active  P: Projects  q: Back"
+                footer = "  ↑/↓: Nav  s: Sort  m: Unreview  p: Active-proj  V: Active  P: Projects  q: Back"
             elif view_mode == "active_projects":
                 footer = "  ↑/↓: Nav  p: Unmark project  o: Finder  P: Back to Active  q: Back"
             else:
@@ -1410,9 +1410,9 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 if selected_tool:
                     recipe_for_hint = cleanup_tools.get(selected_tool)
                     if recipe_for_hint:
-                        tool_hint = f"  T: {recipe_for_hint.label}"
+                        tool_hint = f"  t: {recipe_for_hint.label}"
                 footer = (
-                    "  ↑/↓: Nav  t: Sort  r: Rescan  a: AI  m: Review  p: Project"
+                    "  ↑/↓: Nav  s: Sort  r: Rescan  a: AI  m: Review  p: Project"
                     + tool_hint
                     + "  V: Reviewed  P: Projects  x: Trash  q: Back"
                 )
@@ -1518,7 +1518,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             except Exception as exc:
                 _flash_message(stdscr, f"Launch failed: {exc}")
             continue
-        elif key == ord("T"):
+        elif key == ord("t"):
             rec = rows[selected]["rec"]
             if not rec.tool:
                 _flash_message(stdscr, "No specialized tool for this row.")
@@ -1546,7 +1546,7 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
                 if rows:
                     selected = min(selected, len(rows) - 1)
             continue
-        elif key == ord("t"):
+        elif key == ord("s"):
             selected_path = rows[selected]["rec"].path
             sort_mode = SORT_SIZE if sort_mode == SORT_LADDER else SORT_LADDER
             ordered_recommendations = _sort_recommendations(recommendations, sort_mode)

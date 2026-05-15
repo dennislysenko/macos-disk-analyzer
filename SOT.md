@@ -52,7 +52,7 @@ All bindings are case-sensitive.
 |---------------------|------------------------------------|
 | `↑` / `↓`           | Move selection                     |
 | `fn+↑` / `fn+↓`     | PageUp/PageDown (one page at a time) |
-| `t`                 | Toggle sort: ladder ↔ size-descending |
+| `s`                 | Toggle sort: ladder ↔ size-descending |
 | `q` / `Esc`         | Back to caller                     |
 
 #### Per-row actions (Active view)
@@ -65,7 +65,7 @@ All bindings are case-sensitive.
 | `m`   | Mark this row reviewed (per-scan; filters it out of Active view).      |
 | `p`   | Mark as an active project (global). For `node_modules` and `venv`/`.venv`/`env`/`.env` rows, walks up to the parent project dir; other paths are marked as-is. |
 | `a`   | AI-analyze. Venv rows only. Prompts for agent (Claude / Codex) on first use, optionally remembers the choice, then launches a new Terminal.app window `cd`'d into the venv's parent with a hardcoded prompt asking the agent to sync `requirements.txt` and write a `.python-version`. Non-venv rows flash "AI-analyze only supports Python venvs right now." |
-| `T`   | Open the row's specialized cleaner (see §3.4). Active only on rows whose rule declares a `tool`; flashes "No specialized tool for this row." otherwise. Footer dynamically advertises the tool name when one is available for the selected row. After the tool exits, the ladder rebuilds so updated sizes / disappeared rows are reflected. |
+| `t`   | Open the row's specialized cleaner (see §3.4). Active only on rows whose rule declares a `tool`; flashes "No specialized tool for this row." otherwise. Footer dynamically advertises the tool name when one is available for the selected row. After the tool exits, the ladder rebuilds so updated sizes / disappeared rows are reflected. |
 
 #### Per-row actions (Reviewed view)
 
@@ -308,11 +308,11 @@ Wiring path:
    both invalidate the row's cache entry so the next render re-probes.
 4. The recipe name is threaded through `Recommendation.tool`. Tool-
    bearing rows keep the standard `Action: rationale` primary line and
-   add a third line `▸ Press T to open <recipe.label>` in cyan/bold
+   add a third line `▸ Press t to open <recipe.label>` in cyan/bold
    (the line that's normally a blank gap between rows). Rows without a
    tool keep the blank gap. The footer also advertises
-   `T: <recipe.label>` for the selected row.
-5. On `T`, `show_recommendations` calls
+   `t: <recipe.label>` for the selected row.
+5. On `t`, `show_recommendations` calls
    `recipe.launch(stdscr, path, helpers)`. The `helpers` dict gives the
    recipe `load_prefs`, `save_prefs`, and `flash` so it can prompt for /
    persist tool paths and surface status without owning curses
