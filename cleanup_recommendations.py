@@ -286,6 +286,15 @@ CLEANUP_RULES = [
         "Move important files elsewhere before deleting",
     ),
     CleanupRule(
+        "*/Desktop",
+        "desktop",
+        "human_data",
+        "medium",
+        "review",
+        "Desktop is a working surface — likely a mix of in-flight files and stuff you forgot about",
+        "Move keepers into Documents/projects, then clear the rest",
+    ),
+    CleanupRule(
         "*/NotesBackup",
         "backup",
         "human_data",
@@ -357,8 +366,8 @@ CLEANUP_RULES = [
         "trash",
         "purge_now",
         "safe",
-        "delete",
-        "Already-deleted files awaiting permanent removal",
+        "review",
+        "Already-deleted files awaiting permanent removal — can't be trashed (it IS the trash). Open Finder and click Empty in the Trash window.",
         "Items were already deleted by you",
     ),
     CleanupRule(
@@ -1332,6 +1341,9 @@ def show_recommendations(stdscr, recommendations, scan_dir=None, root_path=None)
             rec = rows[selected]["rec"]
             if rec.path in trash_in_flight:
                 _flash_message(stdscr, "Already trashing this one…")
+                continue
+            if os.path.realpath(rec.path) == os.path.realpath(os.path.expanduser("~/.Trash")):
+                _flash_message(stdscr, "Can't trash the Trash. Open Finder → Trash → Empty.")
                 continue
             if not os.path.exists(rec.path):
                 if scan_dir and root_path:
