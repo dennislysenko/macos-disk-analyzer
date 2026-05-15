@@ -533,8 +533,8 @@ def main():
     global _stats, _executor
 
     parser = argparse.ArgumentParser(description='Analyze disk usage recursively.')
-    parser.add_argument('directory', nargs='?', default=os.path.expanduser('~'),
-                        help='Base directory to analyze (default: user home)')
+    parser.add_argument('directory', nargs='?', default='/',
+                        help='Base directory to analyze (default: entire drive)')
     parser.add_argument('--output', '-o', default='./output',
                         help='Base output directory (default: ./output)')
     parser.add_argument('--min-size', '-m', type=float, default=2.0,

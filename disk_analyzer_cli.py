@@ -205,8 +205,8 @@ def run_scan_tui(stdscr, config):
 
     # --- Step 1: Directory selection ---
     dir_options = [
-        ("Home folder", home_dir),
         ("Entire drive", "/"),
+        ("Home folder", home_dir),
         ("Custom path", None),
     ]
     dir_selected = 0
