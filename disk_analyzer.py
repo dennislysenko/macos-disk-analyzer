@@ -493,9 +493,13 @@ def run_analysis(directory, output_base, base_directory, min_size_gb=2,
                                         root_child_sizes[d] = parts[0]
                                     break
 
-                # Submit any large subdirs not already seen via lookahead
+                # Submit any large subdirs not already seen via lookahead.
+                # IMPORTANT: pass lookahead_remaining=0 here. This callback runs
+                # on a worker thread; doing os.listdir() inline (as lookahead
+                # would) can block the worker on a stalled FS path, and if all
+                # workers end up blocked in callbacks the pool deadlocks.
                 for subdir in large_subdirs:
-                    submit_dir(subdir, depth + 1, LOOKAHEAD)
+                    submit_dir(subdir, depth + 1, 0)
             except Exception as e:
                 log.error(f"Error analyzing {d}: {e}")
             finally:
