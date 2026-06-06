@@ -21,6 +21,8 @@ COLOR_PCT_6 = 6   # 30-40%
 COLOR_PCT_7 = 7   # 40-50%
 COLOR_PCT_8 = 8   # 50%+
 COLOR_SCAN = 9    # rescan progress
+COLOR_GROWTH = 10  # folder grew (positive delta)
+COLOR_SHRINK = 11  # folder shrank (negative delta)
 
 class OutputBrowser:
     def __init__(self, output_dir="./output"):
@@ -44,7 +46,16 @@ class OutputBrowser:
         self._scan_durations = {}  # path -> last scan duration in seconds
         self._scan_target_path = None  # the path being rescanned
         self._scan_target_idx = None  # index in options list being rescanned
-        
+        # 30-day (configurable) change comparison state
+        self.compare_days = 30
+        self.sort_mode = 'size'  # 'size' | 'growth' | 'shrink'
+        self.ref_timestamp_dir = None    # timestamp dir used as the comparison baseline
+        self.ref_interval_days = None    # actual interval (days) to that baseline
+        self.ref_root = None             # scan root of the baseline snapshot (its first line)
+        self._ref_dir_cache = ({}, False)      # cached ({child_path: bytes}, dir_present)
+        self._ref_dir_cache_key = None         # (ref_timestamp_dir, normpath(current_path))
+        self.current_deltas = {}         # path -> delta_bytes (or None when uncomparable)
+
     def log(self, message):
         """Write a debug message to the log file with timestamp"""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -122,6 +133,112 @@ class OutputBrowser:
         
         return data
     
+    def _compute_reference(self):
+        """Pick the snapshot closest to (selected snapshot - compare_days) as the baseline.
+
+        Sets self.ref_timestamp_dir / self.ref_interval_days and invalidates the
+        cached reference index. If no older snapshot exists, ref_timestamp_dir is None."""
+        self.ref_timestamp_dir = None
+        self.ref_interval_days = None
+        self.ref_root = None
+        self._ref_dir_cache = ({}, False)
+        self._ref_dir_cache_key = None
+
+        if not self.timestamp_dir:
+            return
+
+        try:
+            selected_time = datetime.datetime.strptime(self.timestamp_dir, "%Y-%m-%d_%H-%M-%S")
+        except ValueError:
+            return
+
+        target_time = selected_time - datetime.timedelta(days=self.compare_days)
+
+        best_dir = None
+        best_time = None
+        best_distance = None
+        for dir_name, ts in self.load_timestamps():
+            # Only consider snapshots strictly older than the selected one
+            if ts >= selected_time:
+                continue
+            distance = abs((ts - target_time).total_seconds())
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_dir = dir_name
+                best_time = ts
+
+        if best_dir is not None:
+            self.ref_timestamp_dir = best_dir
+            self.ref_interval_days = (selected_time - best_time).days
+
+    def _get_reference_children(self):
+        """Return ({child_path: bytes}, dir_present) for the current dir in the baseline.
+
+        Reads only the single disk_usage.txt that mirrors current_path in the baseline
+        snapshot (the children we're showing), so opening a view is one small file read,
+        cached per directory. dir_present is True when current_path itself was scanned
+        in the baseline (so absent children can be treated as genuinely new)."""
+        if not self.ref_timestamp_dir or not self.current_path:
+            return {}, False
+
+        cache_key = (self.ref_timestamp_dir, os.path.normpath(self.current_path))
+        if self._ref_dir_cache_key == cache_key:
+            return self._ref_dir_cache
+
+        ref_base = os.path.join(self.output_dir, self.ref_timestamp_dir)
+        root_file = os.path.join(ref_base, "disk_usage.txt")
+
+        # Resolve the baseline scan root once (its first line's path)
+        if self.ref_root is None:
+            try:
+                with open(root_file) as f:
+                    first = f.readline().strip().split('\t')
+                if len(first) == 2:
+                    self.ref_root = first[1]
+            except OSError:
+                self.ref_root = None
+
+        result = ({}, False)
+        if self.ref_root:
+            rel = os.path.relpath(self.current_path, self.ref_root)
+            # Only compare when current_path is at/under the baseline root
+            if not rel.startswith('..'):
+                ref_file = root_file if rel == '.' else os.path.join(ref_base, rel, "disk_usage.txt")
+                if os.path.exists(ref_file):
+                    sizes = {}
+                    with open(ref_file) as f:
+                        for line in f:
+                            parts = line.strip().split('\t')
+                            if len(parts) == 2:
+                                sizes[os.path.normpath(parts[1])] = self.parse_size_to_bytes(parts[0])
+                    result = (sizes, True)
+
+        self._ref_dir_cache = result
+        self._ref_dir_cache_key = cache_key
+        return result
+
+    def _compute_delta(self, child_path, child_bytes, ref_sizes, dir_present):
+        """Delta in bytes vs the baseline snapshot, or None when uncomparable.
+
+        - in baseline           -> current - baseline
+        - new (dir was scanned) -> +current  (folder genuinely appeared)
+        - dir absent in baseline -> None      (that subtree wasn't scanned then)"""
+        key = os.path.normpath(child_path)
+        if key in ref_sizes:
+            return child_bytes - ref_sizes[key]
+        if dir_present:
+            return child_bytes
+        return None
+
+    def _format_delta(self, delta):
+        """Format a byte delta like '+2.3G' / '-1.1G', '·' for zero, '—' for no data."""
+        if delta is None:
+            return "—"
+        if delta == 0:
+            return "·"
+        sign = "+" if delta > 0 else "-"
+        return sign + self._format_bytes_human(abs(delta))
+
     def get_current_directory_info(self):
         """Get information about the current directory from disk_usage data"""
         size = "?"
@@ -156,10 +273,30 @@ class OutputBrowser:
                 except ValueError:
                     numeric_size = 0
                 entries.append((dir_name, entry_path, entry_size, numeric_size))
-        
-        # Sort by numeric size (largest first), then by name for equal sizes
-        entries.sort(key=lambda x: (-x[3], x[0].lower()))
-        
+
+        # Compute per-folder change vs the comparison baseline snapshot
+        ref_sizes, dir_present = self._get_reference_children()
+        self.current_deltas = {}
+        for _name, path, _size, numeric in entries:
+            self.current_deltas[path] = self._compute_delta(path, numeric, ref_sizes, dir_present)
+
+        # Sort according to the active mode
+        if self.sort_mode == 'growth':
+            # Biggest gainers first; None (no data) sinks to the bottom
+            entries.sort(key=lambda x: (
+                -(self.current_deltas[x[1]] if self.current_deltas[x[1]] is not None else float('-inf')),
+                x[0].lower(),
+            ))
+        elif self.sort_mode == 'shrink':
+            # Biggest losers first; None (no data) sinks to the bottom
+            entries.sort(key=lambda x: (
+                (self.current_deltas[x[1]] if self.current_deltas[x[1]] is not None else float('inf')),
+                x[0].lower(),
+            ))
+        else:
+            # Default: by numeric size (largest first), then by name for equal sizes
+            entries.sort(key=lambda x: (-x[3], x[0].lower()))
+
         return size, [(name, path, size, numeric) for name, path, size, numeric in entries]
             
     def display_timestamp_selector(self, stdscr):
@@ -248,6 +385,7 @@ class OutputBrowser:
                     if self.disk_usage_data:
                         self.current_path = self.disk_usage_data[0][1]  # Path of the first entry
                         self.root_size_bytes = self.parse_size_to_bytes(self.disk_usage_data[0][0])
+                        self._compute_reference()
                         return True
         
         return False
@@ -521,6 +659,14 @@ class OutputBrowser:
         else:
             curses.init_pair(COLOR_SCAN, curses.COLOR_CYAN, bg)
 
+        # Change deltas: red = grew, green = shrank
+        if curses.COLORS >= 256:
+            curses.init_pair(COLOR_GROWTH, 196, bg)  # red
+            curses.init_pair(COLOR_SHRINK, 46, bg)   # green
+        else:
+            curses.init_pair(COLOR_GROWTH, curses.COLOR_RED, bg)
+            curses.init_pair(COLOR_SHRINK, curses.COLOR_GREEN, bg)
+
     def _pct_color(self, pct):
         """Return the curses color pair attribute for a percentage value."""
         if pct >= 50:
@@ -615,18 +761,40 @@ class OutputBrowser:
                 if len(loc_display) > width - 1:
                     loc_display = f"Location: ...{self.current_path[-(width-14):]}"
                 stdscr.addstr(2, 0, loc_display[:width-1])
-                stdscr.addstr(3, 0, f"Size: {current_size}")
+
+                # Size line, plus comparison baseline + active sort mode
+                sort_label = {
+                    'size': 'Size',
+                    'growth': 'Biggest growth',
+                    'shrink': 'Biggest shrink',
+                }[self.sort_mode]
+                if self.ref_timestamp_dir:
+                    try:
+                        ref_dt = datetime.datetime.strptime(self.ref_timestamp_dir, "%Y-%m-%d_%H-%M-%S")
+                        ref_when = self.format_timestamp(ref_dt)
+                    except ValueError:
+                        ref_when = self.ref_timestamp_dir
+                    delta_info = f"Δ vs {ref_when} ({self.ref_interval_days}d)"
+                else:
+                    delta_info = f"Δ: no snapshot ~{self.compare_days}d older to compare"
+                status_line = f"Size: {current_size}    {delta_info}   Sort: {sort_label}"
+                stdscr.addstr(3, 0, status_line[:width-1])
                 
                 # Divider
                 stdscr.addstr(4, 0, "-" * (width - 1))
 
-                # Column layout: fixed-width name, then Size, %Dir, %Tot
+                # Column layout: fixed-width name, then Size, %Dir, %Tot, Δ
                 col_size = 6
                 col_pct = 6  # "XX.X%"
+                col_delta = 9  # " +123.4G"
                 name_width = 40
 
                 # Column header
-                col_header = f"{'Name':<{name_width}}  {'Size':>{col_size}} {'%Dir':>{col_pct}} {'%Tot':>{col_pct}}"
+                delta_header = f"Δ{self.compare_days}d"
+                col_header = (
+                    f"{'Name':<{name_width}}  {'Size':>{col_size}} {'%Dir':>{col_pct}} "
+                    f"{'%Tot':>{col_pct}} {delta_header:>{col_delta}}"
+                )
                 stdscr.addstr(5, 0, col_header[:width-1], curses.A_DIM)
 
                 # Display directories
@@ -676,6 +844,19 @@ class OutputBrowser:
                             if col_pos + len(pct_tot_str) < width - 1:
                                 pct_attr = base_attr if selected else (base_attr | self._pct_color(pct_total))
                                 stdscr.addstr(y_pos, col_pos, pct_tot_str, pct_attr)
+                                col_pos += len(pct_tot_str)
+
+                            # Δ vs baseline snapshot
+                            delta = self.current_deltas.get(path)
+                            delta_str = f" {self._format_delta(delta):>{col_delta}}"
+                            if col_pos + len(delta_str) < width - 1:
+                                if selected or delta is None or delta == 0:
+                                    delta_attr = base_attr
+                                elif delta > 0:
+                                    delta_attr = base_attr | curses.color_pair(COLOR_GROWTH)
+                                else:
+                                    delta_attr = base_attr | curses.color_pair(COLOR_SHRINK)
+                                stdscr.addstr(y_pos, col_pos, delta_str, delta_attr)
                         else:
                             base_attr = curses.A_REVERSE if i == self.selected_idx else curses.A_NORMAL
                             stdscr.addstr(y_pos, 0, name[:width-1], base_attr)
@@ -707,7 +888,7 @@ class OutputBrowser:
                         scan_footer = f" {spinner} Rescanning {target_name}... {elapsed:.0f}s elapsed (c: cancel)"
                     stdscr.addstr(footer_pos, 0, scan_footer[:width-1], curses.A_BOLD | curses.color_pair(COLOR_SCAN))
                 else:
-                    footer = "↑/↓: Navigate, Enter: Select, s: Rescan, d: Recommend, x: Trash, o: Finder, r: Select run, q: Quit"
+                    footer = "↑/↓: Nav, Enter: Open, t: Sort, [ ]: Window, s: Rescan, d: Recommend, x: Trash, o: Finder, r: Run, q: Quit"
                     stdscr.addstr(footer_pos, 0, footer[:width-1], curses.A_BOLD)
             except curses.error:
                 pass
@@ -760,6 +941,26 @@ class OutputBrowser:
                     _, sel_path, _, _ = options[self.selected_idx]
                     if sel_path and os.path.isdir(sel_path):
                         self.start_rescan(sel_path, self.selected_idx)
+                continue
+            elif key == ord('t'):
+                # Cycle sort mode: size -> growth -> shrink -> size
+                self.sort_mode = {
+                    'size': 'growth',
+                    'growth': 'shrink',
+                    'shrink': 'size',
+                }[self.sort_mode]
+                self.selected_idx = 0
+                self.scroll_offset = 0
+                continue
+            elif key == ord('[') or key == ord(']'):
+                # Adjust the comparison window, then re-pick the baseline snapshot
+                if key == ord('['):
+                    self.compare_days = max(1, self.compare_days - 7)
+                else:
+                    self.compare_days += 7
+                self._compute_reference()
+                self.selected_idx = 0
+                self.scroll_offset = 0
                 continue
             elif key == ord('r'):
                 if self.display_timestamp_selector(stdscr):
