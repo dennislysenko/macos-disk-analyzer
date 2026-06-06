@@ -763,6 +763,15 @@ CLEANUP_RULES = [
         "Run `swift build` to rebuild",
     ),
     CleanupRule(
+        "*/build",
+        "build_artifact",
+        "rebuildable_dev",
+        "safe",
+        "delete",
+        "Xcode build output (sits next to the .xcodeproj) — fully regenerated on the next build",
+        "Xcode regenerates it on the next build (Product → Build, ⌘B)",
+    ),
+    CleanupRule(
         "*/build/SourcePackages",
         "build_artifact",
         "rebuildable_dev",
@@ -933,6 +942,15 @@ def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
     reviewed = _load_reviewed_paths(scan_dir)
     active_projects = _load_active_projects()
 
+    # Dirs that contain an Xcode project/workspace — used to confirm a bare
+    # `build` directory is Xcode build output (ephemeral) rather than some
+    # unrelated `build` folder.
+    xcode_project_dirs = {
+        os.path.dirname(os.path.normpath(p))
+        for p in seen_paths
+        if p.lower().endswith((".xcodeproj", ".xcworkspace"))
+    }
+
     candidates = []
     for path, (size_bytes, _size_str) in seen_paths.items():
         if size_bytes < MIN_RECOMMENDATION_BYTES:
@@ -960,6 +978,12 @@ def generate_recommendations(scan_dir, root_path=None, only_reviewed=False):
                         risk = "medium"
                         tier = "reviewable_state"
                         rationale = "JavaScript dependencies — no lockfile in parent, review before deleting"
+                elif basename == "build":
+                    # Only flag `build` when it's Xcode build output: an
+                    # .xcodeproj/.xcworkspace must sit beside it. Otherwise a
+                    # plain `build` dir is too ambiguous to recommend.
+                    if os.path.dirname(os.path.normpath(path)) not in xcode_project_dirs:
+                        break
                 elif basename in {"venv", ".venv", "env", ".env"} or os.path.isfile(os.path.join(path, "pyvenv.cfg")):
                     dep_file, is_lock = _venv_dependency_file(path)
                     if not dep_file:
