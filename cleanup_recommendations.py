@@ -337,7 +337,7 @@ CLEANUP_RULES = [
         "high",
         "review",
         "Photos library — irreplaceable user media; manage in Photos.app, do not trash the bundle",
-        "Use Photos.app: Optimize Mac Storage, empty Recently Deleted, or selectively delete albums",
+        "Use Photos.app: Optimize Mac Storage, empty Recently Deleted, or migrate to an external drive",
         "photos_cleanup",
     ),
     CleanupRule(

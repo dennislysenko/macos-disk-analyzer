@@ -447,7 +447,7 @@ def _photos_applies(path):
 
 
 def _photos_summary(path):
-    return "Manage in Photos.app: Optimize Storage, empty Recently Deleted, or remove albums — runbook"
+    return "Manage in Photos.app: Optimize Storage, empty Recently Deleted, or move to external drive — runbook"
 
 
 PHOTOS_STEPS = [
@@ -504,7 +504,60 @@ PHOTOS_STEPS = [
         "open_url": "x-apple.systempreferences:com.apple.preference.appleidsettings",
     },
     {
-        "title": "6. Return to the ladder",
+        "title": "6. Already optimized? Move the library to an external drive",
+        "body": (
+            "If Optimize Mac Storage is on and the library is STILL large, "
+            "check the bundle's originals/ folder. If it's near 0 bytes, all "
+            "originals already live in iCloud and the remaining size is local "
+            "derivatives + database — steps 2-4 can't shrink it further. The "
+            "fix is moving the library to an external drive.\n\n"
+            "Requirements: the drive must be APFS or HFS+ (not exFAT/FAT) and "
+            "stay connected, so this suits desktops, not laptops. Note the "
+            "library won't be Spotlight-searchable from an external volume."
+        ),
+        "command": "du -sh ~/Pictures/*.photoslibrary/originals",
+    },
+    {
+        "title": "7. Create a quota-capped volume and copy the library",
+        "body": (
+            "IMPORTANT: don't copy onto a big empty drive directly. Optimize "
+            "Mac Storage scales its local cache to FREE SPACE, so on a roomy "
+            "drive Photos will steadily re-download originals — a 24 GB "
+            "library can grow toward the full iCloud size. Instead, add an "
+            "APFS volume with a hard quota (~2x current library size) to the "
+            "drive's container. This is non-destructive and shares free space "
+            "with existing volumes:\n\n"
+            "  diskutil list                # find the container, e.g. disk7\n"
+            "  diskutil apfs addVolume disk7 APFS PhotosLibrary -quota 50g\n\n"
+            "Then quit Photos and copy (preserves metadata; verify counts "
+            "match before going further):\n\n"
+            "  ditto ~/Pictures/Photos\\ Library.photoslibrary "
+            "/Volumes/PhotosLibrary/Photos\\ Library.photoslibrary\n"
+            "  find <old> -type f | wc -l   # compare with same on <new>"
+        ),
+        "command": None,
+    },
+    {
+        "title": "8. Switch Photos to the new library",
+        "body": (
+            "Hold Option while launching Photos → \"Other Library…\". The "
+            "chooser lists libraries by identical names with no paths, so use "
+            "Cmd+Shift+G in the file dialog to type the new volume's path.\n\n"
+            "First open beachballs for 10-20 min while photolibraryd validates "
+            "the copy — normal, don't force-quit. Then: Settings → General → "
+            "\"Use as System Photo Library\", and re-enable iCloud Photos in "
+            "Settings → iCloud (switching system libraries turns it OFF; it "
+            "re-matches against the cloud without re-uploading).\n\n"
+            "Verify: bottom of the Library view shows \"Last Synced N minutes "
+            "ago\". Then RENAME the old library (don't delete yet), live with "
+            "it a few days, and delete it once nothing has broken. macOS "
+            "purges the old library's derivative cache on its own once it is "
+            "no longer the system library."
+        ),
+        "command": None,
+    },
+    {
+        "title": "9. Return to the ladder",
         "body": (
             "Press q to close this panel. The .photoslibrary row will shrink "
             "on the next scan once iCloud has finished evicting originals."
