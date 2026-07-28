@@ -41,6 +41,53 @@ def is_excluded_path(path_str):
     norm = os.path.normpath(path_str)
     return any(norm == ex or norm.startswith(ex + os.sep) for ex in _excluded_strs)
 
+
+def _detect_mount_points():
+    """Return mount points from the system mount table.
+    APFS firmlinks (/Users, /Applications, ...) do not appear here — only
+    real mounts (external volumes, fuse/NFS mounts like OrbStack's, etc.)."""
+    try:
+        out = subprocess.run(["mount"], capture_output=True, text=True, check=False).stdout
+    except OSError as e:
+        log.warning(f"Could not read mount table: {e}")
+        return []
+    points = []
+    for line in out.splitlines():
+        # Format: <device> on <mount point> (<fstype>, <options>)
+        if " on " not in line:
+            continue
+        rest = line.split(" on ", 1)[1]
+        paren = rest.rfind(" (")
+        if paren != -1:
+            rest = rest[:paren]
+        if rest.startswith("/"):
+            points.append(rest)
+    return points
+
+
+def configure_exclusions(scan_root):
+    """Finalize exclusions for a scan of scan_root: exclude every mounted
+    filesystem except the one containing the scan root, and drop static
+    exclusions that would swallow the scan root itself (e.g. /Volumes when
+    scanning an external drive). One scan = one filesystem; du -x enforces
+    the same rule during traversal."""
+    norm_root = os.path.normpath(scan_root)
+
+    def contains_root(p):
+        return norm_root == p or norm_root.startswith(p + os.sep)
+
+    kept = [p for p in _excluded_strs if not contains_root(p)]
+
+    for mp in _detect_mount_points():
+        norm_mp = os.path.normpath(mp)
+        if norm_mp == "/" or contains_root(norm_mp):
+            continue
+        if norm_mp not in kept:
+            kept.append(norm_mp)
+            log.info(f"Excluding mounted filesystem: {norm_mp}")
+
+    _excluded_strs[:] = kept
+
 def _format_bytes(size_bytes):
     """Convert bytes to human-readable string matching du output format."""
     if size_bytes == 0:
@@ -142,10 +189,13 @@ def run_du_command(directory, use_sudo=False, quiet=False, timeout_seconds=300):
     for name in du_ignore_names:
         ignore_flags.extend(["-I", name])
 
+    # -x: never cross filesystem boundaries. Nested mounts (fuse/NFS like
+    # OrbStack's, network shares, other volumes) can contain symlink cycles
+    # that abort du with no output, and would double-count anyway.
     if use_sudo:
-        du_cmd = ["sudo", "du", "-h", "-d", "1"] + ignore_flags + [directory]
+        du_cmd = ["sudo", "du", "-h", "-x", "-d", "1"] + ignore_flags + [directory]
     else:
-        du_cmd = ["du", "-h", "-d", "1"] + ignore_flags + [directory]
+        du_cmd = ["du", "-h", "-x", "-d", "1"] + ignore_flags + [directory]
 
     try:
         t0 = time.monotonic()
@@ -183,6 +233,17 @@ def run_du_command(directory, use_sudo=False, quiet=False, timeout_seconds=300):
                 if du_result.stderr:
                     stderr_lines = du_result.stderr.strip().splitlines()
                     print(f"  ({len(stderr_lines)} error lines, first: {stderr_lines[0][:120] if stderr_lines else ''})")
+
+        # du can abort with NO output at all (e.g. symlink cycles inside fuse
+        # mounts). Treat that as a hard failure so the caller doesn't save an
+        # empty disk_usage.txt and silently drop the directory.
+        if not du_result.stdout.strip():
+            err_lines = du_result.stderr.strip().splitlines() if du_result.stderr else []
+            first_err = err_lines[0][:200] if err_lines else "(stderr unavailable in quiet mode)"
+            log.error(f"du produced NO output for {directory} (exit {du_result.returncode}): {first_err}")
+            with _print_lock:
+                print(f"  ERROR: du produced no output for {directory} (exit {du_result.returncode}): {first_err}")
+            return ""
 
         # Sort in Python — avoids spawning a subprocess per directory
         lines = du_result.stdout.strip().split('\n')
@@ -396,14 +457,16 @@ def run_analysis(directory, output_base, base_directory, min_size_gb=2,
     run `du` on each in parallel.  The root disk_usage.txt is synthesised from
     the child results so the browser still works.
     """
+    configure_exclusions(directory)
+
     # --- fan-out: seed queue with immediate children of the root ---
     try:
         children = sorted([
             os.path.join(directory, name)
             for name in os.listdir(directory)
-            if os.path.isdir(os.path.join(directory, name))
+            if not is_excluded_path(os.path.join(directory, name))
+               and os.path.isdir(os.path.join(directory, name))
                and not os.path.islink(os.path.join(directory, name))
-               and not is_excluded_path(os.path.join(directory, name))
         ])
     except OSError as e:
         log.error(f"Cannot list {directory}: {e}")
@@ -462,7 +525,7 @@ def run_analysis(directory, output_base, base_directory, min_size_gb=2,
                 try:
                     for name in os.listdir(d):
                         child = os.path.join(d, name)
-                        if os.path.isdir(child) and not os.path.islink(child) and not is_excluded_path(child):
+                        if not is_excluded_path(child) and os.path.isdir(child) and not os.path.islink(child):
                             submit_dir(child, depth + 1, lookahead_remaining - 1)
                 except OSError:
                     pass
