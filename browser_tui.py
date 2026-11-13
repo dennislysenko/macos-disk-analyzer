@@ -10,6 +10,7 @@ import time
 
 from disk_analyzer import run_du_command, filter_excluded_entries
 from file_actions import move_path_to_trash, remove_path_from_scan
+import snapshot_diff
 
 # Color pair IDs for percentage thresholds
 COLOR_PCT_1 = 1   # 2.5-5%
@@ -64,17 +65,7 @@ class OutputBrowser:
         
     def parse_size_to_bytes(self, size_str):
         """Convert size string with units (like '2.5G') to bytes"""
-        if not size_str or size_str == "?":
-            return 0
-        size_str = size_str.strip()
-        multiplier = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4, 'B': 1}
-        try:
-            if size_str[-1].upper() in multiplier:
-                return float(size_str[:-1]) * multiplier[size_str[-1].upper()]
-            else:
-                return float(size_str)
-        except (ValueError, IndexError):
-            return 0
+        return snapshot_diff.parse_size_to_bytes(size_str)
 
     def load_timestamps(self):
         """Load all timestamp directories from the output folder"""
@@ -148,28 +139,14 @@ class OutputBrowser:
             return
 
         try:
-            selected_time = datetime.datetime.strptime(self.timestamp_dir, "%Y-%m-%d_%H-%M-%S")
+            selected_time = datetime.datetime.strptime(self.timestamp_dir, snapshot_diff.SNAPSHOT_FORMAT)
         except ValueError:
             return
 
-        target_time = selected_time - datetime.timedelta(days=self.compare_days)
-
-        best_dir = None
-        best_time = None
-        best_distance = None
-        for dir_name, ts in self.load_timestamps():
-            # Only consider snapshots strictly older than the selected one
-            if ts >= selected_time:
-                continue
-            distance = abs((ts - target_time).total_seconds())
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_dir = dir_name
-                best_time = ts
-
-        if best_dir is not None:
-            self.ref_timestamp_dir = best_dir
-            self.ref_interval_days = (selected_time - best_time).days
+        best = snapshot_diff.pick_baseline(self.load_timestamps(), selected_time, self.compare_days)
+        if best is not None:
+            self.ref_timestamp_dir = best[0]
+            self.ref_interval_days = (selected_time - best[1]).days
 
     def _get_reference_children(self):
         """Return ({child_path: bytes}, dir_present) for the current dir in the baseline.
@@ -186,58 +163,24 @@ class OutputBrowser:
             return self._ref_dir_cache
 
         ref_base = os.path.join(self.output_dir, self.ref_timestamp_dir)
-        root_file = os.path.join(ref_base, "disk_usage.txt")
-
         # Resolve the baseline scan root once (its first line's path)
         if self.ref_root is None:
-            try:
-                with open(root_file) as f:
-                    first = f.readline().strip().split('\t')
-                if len(first) == 2:
-                    self.ref_root = first[1]
-            except OSError:
-                self.ref_root = None
+            self.ref_root = snapshot_diff.snapshot_root(ref_base)
 
-        result = ({}, False)
-        if self.ref_root:
-            rel = os.path.relpath(self.current_path, self.ref_root)
-            # Only compare when current_path is at/under the baseline root
-            if not rel.startswith('..'):
-                ref_file = root_file if rel == '.' else os.path.join(ref_base, rel, "disk_usage.txt")
-                if os.path.exists(ref_file):
-                    sizes = {}
-                    with open(ref_file) as f:
-                        for line in f:
-                            parts = line.strip().split('\t')
-                            if len(parts) == 2:
-                                sizes[os.path.normpath(parts[1])] = self.parse_size_to_bytes(parts[0])
-                    result = (sizes, True)
+        result = snapshot_diff.read_children(ref_base, self.current_path, self.ref_root) \
+            if self.ref_root else ({}, False)
 
         self._ref_dir_cache = result
         self._ref_dir_cache_key = cache_key
         return result
 
     def _compute_delta(self, child_path, child_bytes, ref_sizes, dir_present):
-        """Delta in bytes vs the baseline snapshot, or None when uncomparable.
-
-        - in baseline           -> current - baseline
-        - new (dir was scanned) -> +current  (folder genuinely appeared)
-        - dir absent in baseline -> None      (that subtree wasn't scanned then)"""
-        key = os.path.normpath(child_path)
-        if key in ref_sizes:
-            return child_bytes - ref_sizes[key]
-        if dir_present:
-            return child_bytes
-        return None
+        """Delta in bytes vs the baseline snapshot, or None when uncomparable."""
+        return snapshot_diff.compute_delta(child_path, child_bytes, ref_sizes, dir_present)
 
     def _format_delta(self, delta):
         """Format a byte delta like '+2.3G' / '-1.1G', '·' for zero, '—' for no data."""
-        if delta is None:
-            return "—"
-        if delta == 0:
-            return "·"
-        sign = "+" if delta > 0 else "-"
-        return sign + self._format_bytes_human(abs(delta))
+        return snapshot_diff.format_delta(delta, self._format_bytes_human)
 
     def get_current_directory_info(self):
         """Get information about the current directory from disk_usage data"""

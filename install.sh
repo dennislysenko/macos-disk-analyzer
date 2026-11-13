@@ -12,7 +12,7 @@ INSTALL_DIR="${HOME}/.local/bin"
 LIB_DIR="${HOME}/.local/share/disk-analyzer"
 CONFIG_DIR="${HOME}/.config/disk-analyzer"
 
-FILES="disk_analyzer_cli.py disk_analyzer.py browser_tui.py browser.py browser_gui.py"
+FILES="disk_analyzer_cli.py disk_analyzer.py browser_tui.py browser.py browser_gui.py file_actions.py cleanup_recommendations.py cleanup_tools.py snapshot_diff.py"
 
 echo "Disk Analyzer Installer"
 echo "======================="

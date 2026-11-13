@@ -670,6 +670,33 @@ def cmd_scan(args):
     analyzer_main()
 
 
+def cmd_changes(args):
+    """Subcommand: print the folders that grew (or shrank) most between scans."""
+    import snapshot_diff
+    from disk_analyzer import _format_bytes
+
+    output_dir = os.path.abspath(os.path.expanduser(args.output or get_output_dir(load_config())))
+    result = snapshot_diff.top_changes(output_dir, days=args.days,
+                                       min_bytes=args.min_size * 1024**3,
+                                       top=args.top, shrink=args.shrink)
+    if result is None:
+        print(f"Need at least two scans in {output_dir} to compare. "
+              f"Run `disk-analyzer scan` now and again later.")
+        sys.exit(1)
+
+    newest, baseline = result["newest"], result["baseline"]
+    home = os.path.expanduser("~")
+    verb = "shrank" if args.shrink else "grew"
+    print(f"Folders that {verb} between {baseline[0]} and {newest[0]} "
+          f"({result['interval_days']:.1f} days), changes of {args.min_size:g}G or more:")
+    if not result["rows"]:
+        print("  (none)")
+    for delta, path, size, is_new in result["rows"]:
+        shown = "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+        note = "  (not in older scan)" if is_new else ""
+        print(f"{snapshot_diff.format_delta(delta, _format_bytes):>8}  now {_format_bytes(size):>5}  {shown}{note}")
+
+
 def cmd_browse(args):
     """Subcommand: launch the browser."""
     output_dir = args.output or get_output_dir(load_config())
@@ -775,12 +802,28 @@ def main():
     browse_parser.add_argument("--gui", "-g", action="store_true",
                                help="Use GUI browser instead of TUI")
 
+    # changes subcommand
+    changes_parser = subparsers.add_parser(
+        "changes", help="Show the folders that grew most since an earlier scan")
+    changes_parser.add_argument("--days", type=float, default=7,
+                                help="Compare with the scan closest to this many days before the newest (default: 7)")
+    changes_parser.add_argument("--top", type=int, default=15,
+                                help="How many folders to list (default: 15)")
+    changes_parser.add_argument("--min-size", type=float, default=0.5,
+                                help="Smallest change to list, in GB (default: 0.5)")
+    changes_parser.add_argument("--shrink", action="store_true",
+                                help="List the folders that shrank instead")
+    changes_parser.add_argument("--output", "-o", default=None,
+                                help="Output directory holding the scans (default: ./output)")
+
     args = parser.parse_args()
 
     if args.command == "scan":
         cmd_scan(args)
     elif args.command == "browse":
         cmd_browse(args)
+    elif args.command == "changes":
+        cmd_changes(args)
     elif args.latest_recommendations:
         config = load_config()
         try:

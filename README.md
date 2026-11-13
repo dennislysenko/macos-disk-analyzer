@@ -68,7 +68,19 @@ disk-analyzer browse --output /path/to/output
 
 # Jump straight to the opportunity ladder for the most recent scan
 disk-analyzer --latest-recommendations
+
+# What grew since the scan ~7 days before the newest one (plain text)
+disk-analyzer changes
+disk-analyzer changes --days 30 --top 20 --min-size 1
+disk-analyzer changes --shrink
 ```
+
+`changes` compares the newest scan with the one closest to `--days` earlier
+and lists the folders whose size changed most. When one subfolder explains
+most of a folder's growth, only the subfolder is listed, so the list points
+at what actually grew. "(not in older scan)" means the folder is new, or was
+under the min size last time. It uses the same comparison as the browser's
+change column.
 
 The `--latest-recommendations` flag short-circuits past the main menu and the
 scan picker, opening the ladder directly against the newest timestamp
